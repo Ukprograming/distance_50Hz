@@ -1,0 +1,61 @@
+<!doctype html>
+const hz = Number(hzNum.value)||50;
+await sendLine(`RATE hz=${hz}`);
+});
+
+
+btnConnect.addEventListener('click', async () => {
+try {
+port = await navigator.serial.requestPort();
+await port.open({ baudRate: 115200 });
+writer = port.writable.getWriter();
+} catch (e) {
+alert('Serial接続に失敗: ' + e);
+}
+});
+
+
+btnDisconnect.addEventListener('click', async () => {
+try {
+await sendLine('STOP');
+} catch {}
+reading = false;
+try { if (reader) await reader.cancel(); } catch {}
+try { if (writer) { writer.releaseLock(); writer = null; } } catch {}
+try { if (port) await port.close(); } catch {}
+port = null;
+});
+
+
+btnStart.addEventListener('click', async () => {
+if (!port) { alert('先にConnectしてください'); return; }
+const hz = Number(hzNum.value)||50;
+await sendLine(`START hz=${hz}`);
+startReading();
+});
+
+
+btnStop.addEventListener('click', async () => {
+await sendLine('STOP');
+reading = false; // reader loop終了へ
+});
+
+
+btnCsv.addEventListener('click', () => {
+const csv = toCSV(records);
+const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+const url = URL.createObjectURL(blob);
+const a = document.createElement('a');
+a.href = url; a.download = 'vl53l0x_log.csv';
+document.body.appendChild(a); a.click(); a.remove();
+URL.revokeObjectURL(url);
+});
+
+
+// Feature detection
+if (!('serial' in navigator)) {
+alert('このブラウザはWeb Serialに対応していません。Chrome/Edge系の最新ブラウザをHTTPSでお試しください。');
+}
+</script>
+</body>
+</html>
