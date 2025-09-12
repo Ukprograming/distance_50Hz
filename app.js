@@ -1,245 +1,217 @@
-// --- DOM ---
+// === app.js (full) ===
+
+const logEl = document.getElementById('log');        // <pre id="log">
+const canvas = document.getElementById('chart');     // <canvas id="chart">
 const btnConnect = document.getElementById('btnConnect');
 const btnDisconnect = document.getElementById('btnDisconnect');
 const btnStart = document.getElementById('btnStart');
 const btnStop = document.getElementById('btnStop');
 const btnCsv = document.getElementById('btnCsv');
-const btnClear = document.getElementById('btnClear');
-const btnRate = document.getElementById('btnRate');
-const hzNum = document.getElementById('hzNum');
-const statusEl = document.getElementById('status');
-const logEl = document.getElementById('log');
-const tbody = document.querySelector('#tbl tbody');
-const chartCanvas = document.getElementById('chart');
+const hzNum = document.getElementById('hzNum');      // <input id="hzNum" type="number">
+const yMaxInput = document.getElementById('yMax');   // <input id="yMax" ...> 既存なら
+const xSpanInput = document.getElementById('xSpan'); // <input id="xSpan" ...> 既存なら
 
-// --- State ---
-let port = null;
-let reader = null;
-let writer = null;
+let port, reader, writer;
 let reading = false;
-let t0 = 0;
-const records = []; // {t, mm}
+let deviceReady = false;
+let wantRunning = false;
+let lastHz = 50;
 
-// --- Chart setup ---
-const INITIAL_Y_MAX = 1000;   // 100 cm
-const INITIAL_X_SPAN = 10000; // 10 s
-const chart = new Chart(chartCanvas.getContext('2d'), {
+const records = []; // {tMs, distMm}
+const MAX_POINTS = 10000;
+
+// Chart.js セットアップ
+const ctx = canvas.getContext('2d');
+const chart = new Chart(ctx, {
   type: 'line',
   data: {
     datasets: [{
-      label: 'Distance (mm)',
-      data: [],           // {x: time_ms, y: distance_mm}
-      borderWidth: 1,
+      label: 'Distance [cm]',
+      data: [],           // {x: seconds, y: cm}
       pointRadius: 0,
+      borderWidth: 1,
       tension: 0
     }]
   },
   options: {
-    responsive: true,
-    maintainAspectRatio: false,
     animation: false,
+    responsive: true,
     parsing: false,
-    normalized: true,
     scales: {
       x: {
         type: 'linear',
-        title: { display: true, text: 'Time (ms)' },
-        min: 0,
-        max: INITIAL_X_SPAN
+        title: { text: 'Time [s]', display: true }
       },
       y: {
-        title: { display: true, text: 'Distance (mm)' },
-        min: 0,
-        max: INITIAL_Y_MAX
+        beginAtZero: true,
+        suggestedMax: 100, // 初期 100 cm
+        title: { text: 'Distance [cm]', display: true }
       }
     },
-    plugins: { legend: { display: true } }
+    plugins: { legend: { display: false } }
   }
 });
-const MAX_POINTS = 2000; // 約40秒@50Hz
-let chartTimer = null;
-function startChartTimer() {
-  if (chartTimer) return;
-  chartTimer = setInterval(() => chart.update('none'), 100); // 10Hzで再描画
-}
-function stopChartTimer() {
-  if (!chartTimer) return;
-  clearInterval(chartTimer);
-  chartTimer = null;
+
+function log(s) {
+  if (!logEl) return;
+  logEl.textContent += s + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
 }
 
-// --- Utils ---
-function log(msg) {
-  const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 4;
-  logEl.textContent += (logEl.textContent ? "\n" : "") + msg;
-  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+// CSV 生成
+function toCSV(rows) {
+  const header = 't_ms,dist_mm\n';
+  return header + rows.map(r => `${r.tMs},${r.distMm}`).join('\n');
 }
-function setStatus(s) { statusEl.textContent = s; }
+
+// 行単位デコーダ
+class LineBreakTransformer {
+  constructor() { this.chunks = ''; }
+  transform(chunk, controller) {
+    this.chunks += chunk;
+    const lines = this.chunks.split(/\r?\n/);
+    this.chunks = lines.pop();
+    for (const line of lines) controller.enqueue(line);
+  }
+  flush(controller) {
+    if (this.chunks) controller.enqueue(this.chunks);
+  }
+}
 
 async function sendLine(line) {
-  if (!writer) throw new Error('writer not ready');
+  if (!writer) return;
   const data = new TextEncoder().encode(line + '\n');
   await writer.write(data);
+  log(`# ${line}`);
 }
 
-function niceCeil(v, stepCandidates = [100, 200, 250, 500, 1000, 2000, 5000]) {
-  for (const step of stepCandidates) {
-    const n = Math.ceil(v / step) * step;
-    if (n >= v) return n;
-  }
-  // 最後まで来たら最大ステップで丸め
-  const last = stepCandidates[stepCandidates.length - 1];
-  return Math.ceil(v / last) * last;
+function updateChartAutoAxis() {
+  // X 軸: 表示幅の自動調整（初期 10s）
+  const spanSec = Number(xSpanInput?.value) || 10;
+  const nowSec = records.length ? records[records.length - 1].tMs / 1000 : 0;
+  chart.options.scales.x.min = Math.max(0, nowSec - spanSec);
+  chart.options.scales.x.max = Math.max(spanSec, nowSec);
+
+  // Y 軸: 初期 100cm、超えたら自動拡大
+  const userYMax = Number(yMaxInput?.value) || 100;
+  const latestCm = records.length ? records[records.length - 1].distMm / 10 : 0;
+  const currentMax = chart.options.scales.y.suggestedMax ?? 100;
+  const target = Math.max(userYMax, latestCm * 1.1);
+  chart.options.scales.y.suggestedMax = Math.max(currentMax, Math.ceil(target));
 }
 
-function ensureAxes(t, mm) {
-  const x = chart.options.scales.x;
-  const y = chart.options.scales.y;
-
-  // 横軸：10s刻みで伸ばす
-  if (t > x.max) {
-    const blocks = Math.ceil(t / INITIAL_X_SPAN);
-    x.max = blocks * INITIAL_X_SPAN;
-    // スライディングウィンドウにしたい場合は次行を有効化:
-    // x.min = x.max - INITIAL_X_SPAN;
-  }
-
-  // 縦軸：超えたら「見やすい段階」で拡張（100/200/250/500/1000…）
-  if (mm > y.max) {
-    y.max = niceCeil(mm);
-  }
+function pushPoint(tMs, distMm) {
+  records.push({ tMs, distMm });
+  if (records.length > MAX_POINTS) records.shift();
+  chart.data.datasets[0].data.push({ x: tMs / 1000, y: distMm / 10 });
+  if (chart.data.datasets[0].data.length > MAX_POINTS) chart.data.datasets[0].data.shift();
+  updateChartAutoAxis();
+  chart.update('none');
 }
 
-function addRecord(t, mm) {
-  records.push({ t, mm });
-
-  // 表
-  const tr = document.createElement('tr');
-  const tdT = document.createElement('td');
-  tdT.style.textAlign = 'left';
-  tdT.textContent = String(t);
-  const tdV = document.createElement('td');
-  tdV.textContent = String(mm);
-  tr.appendChild(tdT); tr.appendChild(tdV);
-  tbody.appendChild(tr);
-  if (records.length > 5000) {
-    records.splice(0, records.length - 5000);
-    while (tbody.rows.length > 5000) tbody.deleteRow(0);
-  }
-
-  // グラフ
-  const ds = chart.data.datasets[0].data;
-  ds.push({ x: t, y: mm });
-  if (ds.length > MAX_POINTS) ds.splice(0, ds.length - MAX_POINTS);
-
-  // 軸調整
-  ensureAxes(t, mm);
-}
-
-function toCSV(list) {
-  const lines = ['time_ms,distance_mm'];
-  for (const r of list) lines.push(`${r.t},${r.mm}`);
-  return lines.join('\n');
-}
-
-function parseLine(line) {
-  // Arduino 側: 計測値は素の mm（整数）。メタは "# ..."
-  if (!line) return;
-  if (line.startsWith('#')) { log(line); return; }
-  const v = Number(line.trim());
-  if (Number.isFinite(v)) {
-    const t = Math.round(performance.now() - t0);
-    addRecord(t, v);
-  } else {
-    log(line);
-  }
-}
-
-// --- Reader loop ---
-async function startReading() {
-  if (!port) return;
-  reading = true;
-  t0 = performance.now();
-
+async function startReaderLoop() {
   const textDecoder = new TextDecoderStream();
-  const readableClosed = port.readable.pipeTo(textDecoder.writable).catch(() => {});
-  reader = textDecoder.readable.getReader();
+  const transform = new TransformStream(new LineBreakTransformer());
+  reader = port.readable
+    .pipeThrough(textDecoder)
+    .pipeThrough(transform)
+    .getReader();
 
-  let buf = '';
   try {
     while (reading) {
       const { value, done } = await reader.read();
       if (done) break;
-      if (value) {
-        buf += value;
-        let idx;
-        while ((idx = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, idx).replace(/\r$/, '');
-          buf = buf.slice(idx + 1);
-          parseLine(line);
+      if (!value) continue;
+
+      // ブートメッセージは捨てる
+      if (value.startsWith('ESP-ROM:')) continue;
+
+      if (value.startsWith('#')) {
+        log(value);
+        if (value.indexOf('# READY') === 0) {
+          deviceReady = true;
+          if (wantRunning) {
+            await sendLine(`START hz=${lastHz}`);
+          }
         }
+        continue;
+      }
+
+      // データ行 "t_ms,dist_mm"
+      const m = value.match(/^(\d+)\s*,\s*(\d+)/);
+      if (m) {
+        const t = Number(m[1]);
+        const d = Number(m[2]);
+        pushPoint(t, d);
       }
     }
   } catch (e) {
-    log('read error: ' + e);
+    log(`# read error: ${e}`);
   } finally {
-    try { reader.releaseLock(); } catch {}
+    try { await reader?.cancel(); } catch {}
     reader = null;
-    await readableClosed;
   }
 }
 
-// --- Event handlers ---
-btnConnect.addEventListener('click', async () => {
-  if (!('serial' in navigator)) {
-    alert('このブラウザは Web Serial に非対応です。Chrome/Edge（デスクトップ）を HTTPS で利用してください。');
-    return;
-  }
+btnConnect?.addEventListener('click', async () => {
   try {
     port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 115200 });
+    await port.open({ baudRate: 115200, flowControl: 'none' });
+
+    // ★ 自動リセット対策：DTR/RTS を下げたまま固定
+    if (port.setSignals) {
+      await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+    }
+    // デバイス起動待ち
+    await new Promise(r => setTimeout(r, 300));
+
     writer = port.writable.getWriter();
-    setStatus('Connected');
+    reading = true;
+    deviceReady = false;
+    wantRunning = false;
+    records.length = 0;
+    chart.data.datasets[0].data = [];
+    chart.update('none');
+
     log('# connected');
+    startReaderLoop();
+
+    // 起動確認
+    await sendLine('HELP');
+
   } catch (e) {
     alert('Serial接続に失敗: ' + e);
   }
 });
 
-btnDisconnect.addEventListener('click', async () => {
+btnDisconnect?.addEventListener('click', async () => {
+  wantRunning = false;
   reading = false;
   try { if (reader) await reader.cancel(); } catch {}
   try { if (writer) { writer.releaseLock(); writer = null; } } catch {}
   try { if (port) await port.close(); } catch {}
   port = null;
-  stopChartTimer();
-  setStatus('Not connected');
   log('# disconnected');
 });
 
-btnStart.addEventListener('click', async () => {
-  if (!port || !writer) { alert('先にConnectしてください'); return; }
-  const hz = Math.min(Math.max(Number(hzNum.value) || 50, 1), 50);
-  await sendLine(`START hz=${hz}`);
-  log(`# START hz=${hz}`);
-  startReading();
-  startChartTimer();
+btnStart?.addEventListener('click', async () => {
+  if (!port) { alert('先にConnectしてください'); return; }
+  lastHz = Number(hzNum.value) || 50;
+  wantRunning = true;
+  if (deviceReady) {
+    await sendLine(`START hz=${lastHz}`);
+  } else {
+    // READY が来たら自動で START する
+    log('# waiting READY...');
+  }
 });
 
-btnStop.addEventListener('click', async () => {
-  try { await sendLine('STOP'); } catch {}
-  reading = false;
-  stopChartTimer();
-  log('# STOP sent');
+btnStop?.addEventListener('click', async () => {
+  wantRunning = false;
+  if (writer) await sendLine('STOP');
 });
 
-btnRate.addEventListener('click', async () => {
-  const hz = Math.min(Math.max(Number(hzNum.value) || 50, 1), 50);
-  await sendLine(`RATE hz=${hz}`);
-  log(`# RATE hz=${hz}`);
-});
-
-btnCsv.addEventListener('click', () => {
+btnCsv?.addEventListener('click', () => {
   const csv = toCSV(records);
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
@@ -252,14 +224,7 @@ btnCsv.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
-btnClear.addEventListener('click', () => {
-  records.length = 0;
-  tbody.innerHTML = '';
-  logEl.textContent = '';
-  chart.data.datasets[0].data = [];
-  chart.options.scales.x.min = 0;
-  chart.options.scales.x.max = INITIAL_X_SPAN;
-  chart.options.scales.y.min = 0;
-  chart.options.scales.y.max = INITIAL_Y_MAX;
-  chart.update('none');
-});
+// Feature detection
+if (!('serial' in navigator)) {
+  alert('このブラウザはWeb Serialに対応していません。Chrome/Edge系の最新ブラウザをHTTPSでお試しください。');
+}
