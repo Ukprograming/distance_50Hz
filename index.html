@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>VL53L0X Live Plot (stable simple)</title>
+<title>VL53L0X Live Plot (stable simple v2)</title>
 <style>
   :root{ --h:60vh }
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;margin:16px}
@@ -20,7 +20,7 @@
 </style>
 </head>
 <body>
-<h1>VL53L0X Live Plot <small>stable-simple</small></h1>
+<h1>VL53L0X Live Plot <small>stable-simple v2</small></h1>
 
 <div class="row">
   <button id="btnConnect">Connect</button>
@@ -47,14 +47,15 @@ function log(...args){
   logEl.scrollTop = logEl.scrollHeight;
 }
 function setStatus(s){ document.getElementById('status').textContent = s; }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
-/* ====== Web Serial サポート確認 ====== */
+/* ====== Web Serial 確認 ====== */
 if(!('serial' in navigator)){
   alert('このブラウザはWeb Serialに未対応です。Chrome/EdgeをHTTPSでご利用ください。');
   log('navigator.serial がありません。');
 }
 
-/* ====== 要素参照 ====== */
+/* ====== 要素 ====== */
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
 const hzNum = document.getElementById('hzNum');
@@ -71,13 +72,12 @@ let t0=0, rafId=null;
 const rec=[]; // {t, cm}
 let yMax=100, xMax=10;
 
-/* ====== Canvas DPI調整（安定版） ====== */
+/* ====== Canvas DPI調整 ====== */
 function fitCanvas(){
   const rect = cv.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
   cv.width  = Math.max(1, Math.floor(rect.width  * ratio));
   cv.height = Math.max(1, Math.floor(rect.height * ratio));
-  // 描画座標はCSSピクセルに統一
   ctx.setTransform(1,0,0,1,0,0);
   ctx.scale(ratio, ratio);
   draw();
@@ -95,7 +95,6 @@ function y2px(y){ const h=cssH()-pad.t-pad.b; return pad.t + (1-y/yMax)*h; }
 function drawAxes(){
   const w=cssW(), h=cssH();
   ctx.clearRect(0,0,w,h);
-  // 背景
   ctx.fillStyle="#fff"; ctx.fillRect(0,0,w,h);
 
   // 横グリッド（距離）
@@ -114,12 +113,10 @@ function drawAxes(){
     ctx.beginPath(); ctx.moveTo(px,pad.t); ctx.lineTo(px,h-pad.b); ctx.stroke();
   }
 
-  // 軸ラベル
   ctx.fillStyle="#111"; ctx.font="12px system-ui";
   ctx.fillText("Distance [cm]", 6, 14);
   ctx.fillText("Time [s]", w-56, h-6);
 }
-
 function draw(){
   drawAxes();
   if(rec.length<2) return;
@@ -132,21 +129,9 @@ function draw(){
   }
   ctx.stroke();
 }
-
-function scheduleDraw(){
-  if(rafId) return;
-  rafId = requestAnimationFrame(()=>{ rafId=null; draw(); });
-}
-
-function resetPlotOnly(){
-  rec.length=0; yMax=100; xMax=10; t0=performance.now();
-  scheduleDraw();
-}
-
-function updateAxes(t,cm){
-  if(cm>yMax){ yMax = Math.ceil(cm/50)*50; }
-  if(t>xMax){ xMax = Math.ceil(t/10)*10; }
-}
+function scheduleDraw(){ if(rafId) return; rafId = requestAnimationFrame(()=>{ rafId=null; draw(); }); }
+function resetPlotOnly(){ rec.length=0; yMax=100; xMax=10; t0=performance.now(); scheduleDraw(); }
+function updateAxes(t,cm){ if(cm>yMax) yMax=Math.ceil(cm/50)*50; if(t>xMax) xMax=Math.ceil(t/10)*10; }
 
 /* ====== シリアル送受信 ====== */
 async function sendLine(s){
@@ -154,26 +139,39 @@ async function sendLine(s){
   log('> ', s);
   await writer.write(new TextEncoder().encode(s+"\n"));
 }
-
 class LineBreakTransformer{
-  constructor(){ this.container=""; }
+  constructor(){ this.container=""; this.count=0; }
   transform(chunk,controller){
     this.container += chunk;
     const lines = this.container.split(/\r?\n/);
     this.container = lines.pop();
-    for(const l of lines) controller.enqueue(l);
+    for(const l of lines){
+      // 最初の20行はデバッグ出力
+      if(this.count<20){ log('[RX]', l); this.count++; }
+      controller.enqueue(l);
+    }
   }
-  flush(controller){ if(this.container) controller.enqueue(this.container); }
+  flush(controller){ if(this.container){ controller.enqueue(this.container); this.container=""; } }
 }
 
 function handleLine(line){
   const s = line.trim();
-  if(!/^-?\d+(\.\d+)?$/.test(s)) { // 数値以外（ESP-ROM文字列など）は無視
-    return;
-  }
-  const mm = Number(s);
-  if(!isFinite(mm) || mm<0 || mm>4000) return; // 0〜400cm 以外は破棄
-  const cm = mm/10;
+
+  // 明示ステータス行
+  if(/^#\s*start/i.test(s)){ setStatus('RUN'); return; }
+  if(/^#\s*stop/i.test(s)){ setStatus('STOP'); return; }
+
+  // 行の中の最初の数値を取得（小数OK）
+  const m = s.match(/-?\d+(?:\.\d+)?/);
+  if(!m) return;
+
+  const num = Number(m[0]);
+  if(!isFinite(num)) return;
+
+  // mm想定。異常値除去（0〜4000mm）
+  if(num<0 || num>4000) return;
+
+  const cm = num/10;
   const t  = (performance.now() - t0)/1000;
   rec.push({t,cm});
   updateAxes(t,cm);
@@ -191,21 +189,17 @@ btnConnect.addEventListener('click', async ()=>{
     setStatus('CONNECTED');
     log('Opened. baud=115200');
   }catch(e){
-    log('Connect失敗:', e && e.message ? e.message : e);
+    log('Connect失敗:', e?.message ?? e);
     alert('Serial接続に失敗: '+ e);
   }
 });
 
 btnDisconnect.addEventListener('click', async ()=>{
   try{ await sendLine('STOP'); }catch(_){}
-  try{
-    reading=false;
-    if(reader) await reader.cancel();
-  }catch(_){}
+  try{ reading=false; if(reader) await reader.cancel(); }catch(_){}
   try{ if(writer){ writer.releaseLock(); writer=null; } }catch(_){}
   try{ if(port){ await port.close(); } }catch(_){}
-  port=null; setStatus('DISCONNECTED');
-  log('Disconnected.');
+  port=null; setStatus('DISCONNECTED'); log('Disconnected.');
 });
 
 btnStart.addEventListener('click', async ()=>{
@@ -213,14 +207,19 @@ btnStart.addEventListener('click', async ()=>{
   const hz = Math.max(1, Math.min(50, Number(hzNum.value)||50));
   resetPlotOnly();
   try{
+    // 先にRATE、少し待ってからSTART（FW側の期待に合わせる）
+    await sendLine(`RATE hz=${hz}`);
+    await sleep(50);
     await sendLine(`START hz=${hz}`);
-    // 受信ループ開始
+
     if(reading){ log('既にreading中'); return; }
     reading=true; setStatus('RUN');
+
     const decoder = new TextDecoderStream();
     const piping = port.readable.pipeTo(decoder.writable).catch(()=>{});
     const lineStream = decoder.readable.pipeThrough(new TransformStream(new LineBreakTransformer()));
     reader = lineStream.getReader();
+
     (async ()=>{
       try{
         for(;;){
@@ -235,6 +234,10 @@ btnStart.addEventListener('click', async ()=>{
         log('reader loop end');
       }
     })();
+
+    // 1秒待ってもサンプル0なら注意を出す
+    setTimeout(()=>{ if(reading && rec.length===0){ log('※ まだ数値行を受信していません。FWの出力形式（例: "820" or "mm=820"）を確認してください。'); } }, 1000);
+
   }catch(e){
     log('Start失敗:', e);
     alert('Start処理で失敗: '+e);
@@ -244,8 +247,7 @@ btnStart.addEventListener('click', async ()=>{
 btnStop.addEventListener('click', async ()=>{
   try{ await sendLine('STOP'); }catch(_){}
   try{ reading=false; if(reader) await reader.cancel(); }catch(_){}
-  setStatus('STOP');
-  log('STOP sent.');
+  setStatus('STOP'); log('STOP sent.');
 });
 
 btnReset.addEventListener('click', ()=>{
@@ -268,7 +270,7 @@ btnCsv.addEventListener('click', ()=>{
 fitCanvas();
 resetPlotOnly();
 draw();
-log('Ready. If Connectが反応しない場合、他アプリ(Arduino Serial Monitor等)でポートを掴んでいないか確認してください。');
+log('Ready. Connect→Start。最初の20行はRXログに表示します。');
 </script>
 </body>
 </html>
