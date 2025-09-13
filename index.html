@@ -4,21 +4,36 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>VL53L0X Live Plot</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<!-- Chart.js（CDN → フォールバック） -->
+<script>
+(function(){
+  function load(src, onload, onerror){
+    var s=document.createElement('script'); s.src=src; s.onload=onload; s.onerror=onerror; document.head.appendChild(s);
+  }
+  load(
+    "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js",
+    null,
+    function(){ load("https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js"); }
+  );
+})();
+</script>
 <style>
+  :root{--h:60vh}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:16px}
-  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+  h1{margin:0 0 8px}
+  small{color:#666}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
   .row>*{height:32px}
-  input[type="number"]{width:80px;padding:4px 6px}
+  input[type="number"]{width:84px;padding:4px 6px}
   select{height:32px}
   button{padding:6px 10px}
-  #status{font-weight:700;margin-left:8px}
-  #chartWrap{width:100%;height:62vh}
+  #status{font-weight:700;margin-left:10px}
+  #chartWrap{width:100%;height:var(--h)}
   canvas{width:100%!important;height:100%!important}
 </style>
 </head>
 <body>
-  <h1>VL53L0X Live Plot</h1>
+  <h1>VL53L0X Live Plot <small>build: 2025-09-13 v2</small></h1>
 
   <div class="row">
     <button id="btnConnect">Connect</button>
@@ -29,13 +44,13 @@
     </label>
 
     <label>MA N:
-      <input id="maNum" type="number" value="5" min="1" max="50" step="1" />
+      <input id="maNum" type="number" value="5" min="1" max="50" step="1">
     </label>
 
     <label>表示:
       <select id="modeSel">
-        <option value="ma">移動平均のみ</option>
-        <option value="raw">生データのみ</option>
+        <option value="ma" selected>MAのみ</option>
+        <option value="raw">RAWのみ</option>
         <option value="both">両方</option>
       </select>
     </label>
@@ -53,116 +68,95 @@
   </div>
 
 <script>
-/* ====================== 状態変数 ====================== */
+/* ======= 早期チェック ======= */
+if(!('serial' in navigator)){
+  alert('このブラウザはWeb Serialに対応していません。Chrome/EdgeをHTTPSでお使いください。');
+}
+
+/* ======= 参照取得 ======= */
+const el = (id)=>document.getElementById(id);
+const btnConnect=el('btnConnect'), btnDisconnect=el('btnDisconnect');
+const btnStart=el('btnStart'), btnStop=el('btnStop'), btnReset=el('btnReset');
+const btnCsv=el('btnCsv'), hzNum=el('hzNum'), maNum=el('maNum'), modeSel=el('modeSel'), statusEl=el('status');
+
+/* ======= 状態 ======= */
 let port=null, reader=null, writer=null, reading=false;
 let t0=0;
-const records=[];   // {t:sec, raw:cm, ma:cm}
-let yMax=100;       // Y軸初期上限 100cm
-let xMax=10;        // X軸初期上限 10s
-let maN=5;          // 移動平均点数
-let maBuf=[];       // MA用リングバッファ
+const rec=[]; // {t,raw,ma}
+let yMax=100, xMax=10;
+let maN=5, maBuf=[];
 
-/* ====================== Chart.js 準備 ====================== */
-const ctx=document.getElementById('chart').getContext('2d');
-const datasetRaw={
-  label:'RAW (cm)',
-  data:[],                  // {x,y}
-  borderWidth:1.5,
-  pointRadius:0,
-  tension:0
-};
-const datasetMA={
-  label:`MA${maN} (cm)`,
-  data:[],
-  borderWidth:2,
-  pointRadius:0,
-  tension:0
-};
-const chart=new Chart(ctx,{
-  type:'line',
-  data:{datasets:[datasetMA,datasetRaw]}, // デフォルトはMAのみ表示
-  options:{
-    animation:false,
-    responsive:true,
-    maintainAspectRatio:false,
-    parsing:false, // {x,y}オブジェクトをそのまま使う
-    scales:{
-      x:{type:'linear',title:{display:true,text:'Time [s]'},min:0,max:xMax},
-      y:{title:{display:true,text:'Distance [cm]'},min:0,max:yMax}
-    },
-    plugins:{
-      legend:{display:true},
-      decimation:{enabled:false}
-    }
+/* ======= Chart.js 準備 ======= */
+function ensureChartJS(){
+  if(!window.Chart){
+    alert('Chart.js が読み込めませんでした。ネットワークまたはCDNブロックをご確認ください。');
+    throw new Error('Chart.js not loaded');
   }
-});
-function applyMode(){
-  const mode=document.getElementById('modeSel').value;
-  if(mode==='ma'){ datasetMA.hidden=false; datasetRaw.hidden=true; }
-  else if(mode==='raw'){ datasetMA.hidden=true; datasetRaw.hidden=false; }
-  else { datasetMA.hidden=false; datasetRaw.hidden=false; }
+}
+function makeChart(){
+  ensureChartJS();
+  const ctx = el('chart').getContext('2d');
+  const datasetRaw={label:'RAW (cm)',data:[],borderWidth:1.5,pointRadius:0,tension:0};
+  const datasetMA ={label:`MA${maN} (cm)`,data:[],borderWidth:2,pointRadius:0,tension:0};
+  const chart=new Chart(ctx,{
+    type:'line',
+    data:{datasets:[datasetMA,datasetRaw]},
+    options:{
+      animation:false,responsive:true,maintainAspectRatio:false,parsing:false,
+      scales:{x:{type:'linear',title:{display:true,text:'Time [s]'},min:0,max:xMax},
+              y:{title:{display:true,text:'Distance [cm]'},min:0,max:yMax}},
+      plugins:{legend:{display:true}}
+    }
+  });
+  return {chart,datasetRaw,datasetMA};
+}
+const {chart,datasetRaw,datasetMA}=makeChart();
+
+function setMode(){
+  const v=modeSel.value;
+  datasetMA.hidden = (v==='raw');
+  datasetRaw.hidden= (v==='ma');
   chart.update();
 }
-function updateAxesIfNeeded(t,cm){
+
+/* ======= グラフ＆MA ======= */
+function resetPlotOnly(){
+  rec.length=0; datasetRaw.data.length=0; datasetMA.data.length=0; maBuf.length=0;
+  yMax=100; xMax=10;
+  chart.options.scales.y.max=yMax; chart.options.scales.x.max=xMax;
+  datasetMA.label=`MA${maN} (cm)`;
+  t0=performance.now();
+  chart.update();
+}
+function updateAxes(t,cm){
   if(cm>yMax){ yMax=Math.ceil(cm/50)*50; chart.options.scales.y.max=yMax; }
   if(t>xMax){ xMax=Math.ceil(t/10)*10;   chart.options.scales.x.max=xMax; }
 }
-function addPoints(t,raw,ma){
-  if(!Number.isFinite(raw)) return;
+function addPoint(t,raw,ma){
   datasetRaw.data.push({x:t,y:raw});
-  if(Number.isFinite(ma)) datasetMA.data.push({x:t,y:ma});
+  datasetMA.data.push({x:t,y:ma});
   chart.update('none');
 }
-function resetPlotOnly(){
-  records.length=0;
-  datasetRaw.data.length=0;
-  datasetMA.data.length=0;
-  maBuf.length=0;
-  yMax=100; xMax=10;
-  chart.options.scales.y.max=yMax;
-  chart.options.scales.x.max=xMax;
-  t0=performance.now();
-  datasetMA.label=`MA${maN} (cm)`;
-  chart.update();
-}
-
-/* ====================== 移動平均 ====================== */
 function sma(v){
-  maBuf.push(v);
-  if(maBuf.length>maN) maBuf.shift();
+  maBuf.push(v); if(maBuf.length>maN) maBuf.shift();
   let s=0; for(let i=0;i<maBuf.length;i++) s+=maBuf[i];
   return s/maBuf.length;
 }
-function recomputeMAForAll(){
+function recomputeMA(){
   maBuf.length=0;
   datasetMA.data.length=0;
-  for(const r of records){
-    r.ma=sma(r.raw);
-    datasetMA.data.push({x:r.t,y:r.ma});
-  }
-  datasetMA.label=`MA${maN} (cm)`;
-  chart.update();
+  for(const r of rec){ r.ma=sma(r.raw); datasetMA.data.push({x:r.t,y:r.ma}); }
+  datasetMA.label=`MA${maN} (cm)`; chart.update();
 }
 
-/* ====================== Web Serial ====================== */
-const btnConnect=document.getElementById('btnConnect');
-const btnDisconnect=document.getElementById('btnDisconnect');
-const btnStart=document.getElementById('btnStart');
-const btnStop=document.getElementById('btnStop');
-const btnReset=document.getElementById('btnReset');
-const btnCsv=document.getElementById('btnCsv');
-const hzNum=document.getElementById('hzNum');
-const maNum=document.getElementById('maNum');
-const modeSel=document.getElementById('modeSel');
-const statusEl=document.getElementById('status');
-
+/* ======= Web Serial ======= */
 function setStatus(s){ statusEl.textContent=s; }
 
 async function sendLine(s){
   if(!writer) return;
-  const enc=new TextEncoder().encode(s+"\n");
-  await writer.write(enc);
+  await writer.write(new TextEncoder().encode(s+"\n"));
 }
+
 class LineBreakTransformer{
   constructor(){ this.container=""; }
   transform(chunk,controller){
@@ -174,54 +168,48 @@ class LineBreakTransformer{
   flush(controller){ if(this.container) controller.enqueue(this.container); }
 }
 
-/* 数字だけの行（mm）を採用 */
-function processLine(line){
+function handleLine(line){
   const s=line.trim();
-  if(!/^-?\d+(?:\.\d+)?$/.test(s)) return;
-  const mm=parseFloat(s);
+  // 数字の行だけ採用（mm）
+  if(!/^-?\d+(\.\d+)?$/.test(s)) return;
+  const mm=Number(s);
   if(!isFinite(mm) || mm<0 || mm>4000) return;
-
-  const raw=mm/10;            // cm
-  const ma=sma(raw);
+  const cm=mm/10;
   const t=(performance.now()-t0)/1000;
-
-  records.push({t,raw,ma});
-  updateAxesIfNeeded(t, raw);
-  addPoints(t, raw, ma);
+  const ma=sma(cm);
+  rec.push({t,raw:cm,ma});
+  updateAxes(t,cm);
+  addPoint(t,cm,ma);
 }
 
 async function startReading(){
   if(!port || reading) return;
-  reading=true;
-  setStatus('RUN');           // ← Start時に必ずRUNを表示
+  reading=true; setStatus('RUN');
   t0=performance.now();
-
-  const textDecoder=new TextDecoderStream();
-  const closedReadable=port.readable.pipeTo(textDecoder.writable).catch(()=>{});
-  const lineStream=textDecoder.readable.pipeThrough(new TransformStream(new LineBreakTransformer()));
+  const decoder=new TextDecoderStream();
+  const piping=port.readable.pipeTo(decoder.writable).catch(()=>{});
+  const lineStream=decoder.readable.pipeThrough(new TransformStream(new LineBreakTransformer()));
   reader=lineStream.getReader();
-
   try{
     while(reading){
       const {value,done}=await reader.read();
       if(done || !reading) break;
-      if(value!==undefined) processLine(value);
+      if(value!==undefined) handleLine(value);
     }
-  }catch(_){/* ignore */}
+  }catch(_){}
   finally{
     try{ reader.releaseLock(); }catch(_){}
-    await closedReadable.catch(()=>{});
+    await piping.catch(()=>{});
   }
 }
-
 async function stopReading(){
   reading=false;
   try{ if(reader) await reader.cancel(); }catch(_){}
   setStatus('STOP');
 }
 
-/* ====================== UIイベント ====================== */
-btnConnect.addEventListener('click',async()=>{
+/* ======= イベント ======= */
+btnConnect.addEventListener('click', async ()=>{
   try{
     port=await navigator.serial.requestPort();
     await port.open({baudRate:115200});
@@ -229,59 +217,43 @@ btnConnect.addEventListener('click',async()=>{
     setStatus('CONNECTED');
   }catch(e){ alert('Serial接続に失敗: '+e); }
 });
-
-btnDisconnect.addEventListener('click',async()=>{
+btnDisconnect.addEventListener('click', async ()=>{
   try{ await sendLine('STOP'); }catch(_){}
   await stopReading();
   try{ if(writer){ writer.releaseLock(); writer=null; } }catch(_){}
   try{ if(port) await port.close(); }catch(_){}
-  port=null;
-  setStatus('DISCONNECTED');
+  port=null; setStatus('DISCONNECTED');
 });
-
-btnStart.addEventListener('click',async()=>{
+btnStart.addEventListener('click', async ()=>{
   if(!port){ alert('先にConnectしてください'); return; }
-  const hz=Math.max(1,Math.min(50,Number(hzNum.value)||50));
-  resetPlotOnly();                 // グラフ/バッファだけ初期化
+  const hz=Math.max(1,Math.min(50, Number(hzNum.value)||50));
+  resetPlotOnly();
   await sendLine(`START hz=${hz}`);
   startReading();
 });
-
-btnStop.addEventListener('click',async()=>{
-  await sendLine('STOP');
-  await stopReading();
+btnStop.addEventListener('click', async ()=>{
+  await sendLine('STOP'); await stopReading();
 });
-
-btnReset.addEventListener('click',()=>{
-  resetPlotOnly();                 // 読み取りは続行
-  setStatus(reading ? 'RUN (RESET)' : 'RESET');
+btnReset.addEventListener('click', ()=>{
+  resetPlotOnly(); setStatus(reading ? 'RUN (RESET)' : 'RESET');
 });
-
-btnCsv.addEventListener('click',()=>{
+btnCsv.addEventListener('click', ()=>{
   let csv="t_sec,raw_cm,ma_cm\n";
-  for(const r of records) csv+=`${r.t.toFixed(3)},${(r.raw??'').toFixed(3)},${(r.ma??'').toFixed(3)}\n`;
+  for(const r of rec){ csv+=`${r.t.toFixed(3)},${r.raw.toFixed(3)},${r.ma.toFixed(3)}\n`; }
   const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
   const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');
-  a.href=url; a.download='vl53l0x_log.csv';
-  document.body.appendChild(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
+  const a=document.createElement('a'); a.href=url; a.download='vl53l0x_log.csv';
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
 });
-
-maNum.addEventListener('change',()=>{
-  const n=Math.max(1,Math.min(50,Number(maNum.value)||5));
-  maN=n; maNum.value=n;
-  recomputeMAForAll();
+maNum.addEventListener('change', ()=>{
+  const n=Math.max(1,Math.min(50, Number(maNum.value)||5));
+  maN=n; maNum.value=n; recomputeMA();
 });
+modeSel.addEventListener('change', setMode);
 
-modeSel.addEventListener('change',applyMode);
-
-/* ====================== 初期チェック ====================== */
-if(!('serial' in navigator)){
-  alert('このブラウザはWeb Serialに対応していません。Chrome/EdgeのHTTPSでお試しください。');
-}
-applyMode();         // 初期: 移動平均のみ
-resetPlotOnly();     // 軸を初期化
+/* 初期設定 */
+setMode();
+resetPlotOnly();
 </script>
 </body>
 </html>
