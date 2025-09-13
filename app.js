@@ -1,33 +1,39 @@
-// === app.js (full) ===
+// ===== app.js =====
 
-const logEl = document.getElementById('log');        // <pre id="log">
-const canvas = document.getElementById('chart');     // <canvas id="chart">
+// DOM
+const canvas = document.getElementById('chart');
+const statusEl = document.getElementById('status');
 const btnConnect = document.getElementById('btnConnect');
 const btnDisconnect = document.getElementById('btnDisconnect');
 const btnStart = document.getElementById('btnStart');
 const btnStop = document.getElementById('btnStop');
 const btnCsv = document.getElementById('btnCsv');
-const hzNum = document.getElementById('hzNum');      // <input id="hzNum" type="number">
-const yMaxInput = document.getElementById('yMax');   // <input id="yMax" ...> 既存なら
-const xSpanInput = document.getElementById('xSpan'); // <input id="xSpan" ...> 既存なら
+const hzNum = document.getElementById('hzNum');
+const logEl = document.getElementById('log'); // 画面には非表示
 
+// 状態
 let port, reader, writer;
 let reading = false;
 let deviceReady = false;
 let wantRunning = false;
 let lastHz = 50;
 
+// 記録（CSV用）
 const records = []; // {tMs, distMm}
 const MAX_POINTS = 10000;
 
-// Chart.js セットアップ
+// 軸の初期条件
+const X_SPAN_DEFAULT_SEC = 10;   // 横軸 初期 10s（自動スライド）
+const Y_INIT_MAX_CM = 100;       // 縦軸 初期 100cm（超えたら自動拡大）
+
+// Chart.js
 const ctx = canvas.getContext('2d');
 const chart = new Chart(ctx, {
   type: 'line',
   data: {
     datasets: [{
       label: 'Distance [cm]',
-      data: [],           // {x: seconds, y: cm}
+      data: [], // {x: seconds, y: cm}
       pointRadius: 0,
       borderWidth: 1,
       tension: 0
@@ -36,15 +42,18 @@ const chart = new Chart(ctx, {
   options: {
     animation: false,
     responsive: true,
+    maintainAspectRatio: false, // 親要素(#wrap)の高さに合わせる
     parsing: false,
     scales: {
       x: {
         type: 'linear',
-        title: { text: 'Time [s]', display: true }
+        title: { text: 'Time [s]', display: true },
+        min: 0,
+        max: X_SPAN_DEFAULT_SEC
       },
       y: {
         beginAtZero: true,
-        suggestedMax: 100, // 初期 100 cm
+        suggestedMax: Y_INIT_MAX_CM,
         title: { text: 'Distance [cm]', display: true }
       }
     },
@@ -52,10 +61,12 @@ const chart = new Chart(ctx, {
   }
 });
 
-function log(s) {
+function setStatus(msg) {
+  if (statusEl) statusEl.textContent = msg ?? '';
+}
+function logDebug(s) {
   if (!logEl) return;
   logEl.textContent += s + '\n';
-  logEl.scrollTop = logEl.scrollHeight;
 }
 
 // CSV 生成
@@ -82,31 +93,37 @@ async function sendLine(line) {
   if (!writer) return;
   const data = new TextEncoder().encode(line + '\n');
   await writer.write(data);
-  log(`# ${line}`);
+  // 送ったコマンドは画面には出さない
+  logDebug('# ' + line);
 }
 
 function updateChartAutoAxis() {
-  // X 軸: 表示幅の自動調整（初期 10s）
-  const spanSec = Number(xSpanInput?.value) || 10;
-  const nowSec = records.length ? records[records.length - 1].tMs / 1000 : 0;
-  chart.options.scales.x.min = Math.max(0, nowSec - spanSec);
-  chart.options.scales.x.max = Math.max(spanSec, nowSec);
+  const data = chart.data.datasets[0].data;
+  if (data.length === 0) return;
 
-  // Y 軸: 初期 100cm、超えたら自動拡大
-  const userYMax = Number(yMaxInput?.value) || 100;
-  const latestCm = records.length ? records[records.length - 1].distMm / 10 : 0;
-  const currentMax = chart.options.scales.y.suggestedMax ?? 100;
-  const target = Math.max(userYMax, latestCm * 1.1);
-  chart.options.scales.y.suggestedMax = Math.max(currentMax, Math.ceil(target));
+  const nowSec = data[data.length - 1].x;
+  // 横軸は最新から既定幅だけ表示
+  chart.options.scales.x.min = Math.max(0, nowSec - X_SPAN_DEFAULT_SEC);
+  chart.options.scales.x.max = Math.max(X_SPAN_DEFAULT_SEC, nowSec);
+
+  // 縦軸は 100cm を基準に、越えたら自動拡大
+  const latestCm = data[data.length - 1].y;
+  const curMax = chart.options.scales.y.suggestedMax ?? Y_INIT_MAX_CM;
+  const target = Math.max(Y_INIT_MAX_CM, Math.ceil(latestCm * 1.1));
+  chart.options.scales.y.suggestedMax = Math.max(curMax, target);
 }
 
 function pushPoint(tMs, distMm) {
   records.push({ tMs, distMm });
   if (records.length > MAX_POINTS) records.shift();
-  chart.data.datasets[0].data.push({ x: tMs / 1000, y: distMm / 10 });
-  if (chart.data.datasets[0].data.length > MAX_POINTS) chart.data.datasets[0].data.shift();
+
+  const point = { x: tMs / 1000, y: distMm / 10 };
+  const arr = chart.data.datasets[0].data;
+  arr.push(point);
+  if (arr.length > MAX_POINTS) arr.shift();
+
   updateChartAutoAxis();
-  chart.update('none');
+  chart.update('none'); // アニメなし即時更新
 }
 
 async function startReaderLoop() {
@@ -123,18 +140,22 @@ async function startReaderLoop() {
       if (done) break;
       if (!value) continue;
 
-      // ブートメッセージは捨てる
+      // ブートメッセージは無視（画面にも出さない）
       if (value.startsWith('ESP-ROM:')) continue;
 
+      // ステータス行（# で始まる）だけ小さく状態表示
       if (value.startsWith('#')) {
-        log(value);
+        logDebug(value);
         if (value.indexOf('# READY') === 0) {
           deviceReady = true;
-          if (wantRunning) {
-            await sendLine(`START hz=${lastHz}`);
-          }
+          setStatus('READY');
+          if (wantRunning) await sendLine(`START hz=${lastHz}`);
+        } else if (value.indexOf('# START') === 0) {
+          setStatus(`RUNNING @ ${lastHz} Hz`);
+        } else if (value.indexOf('# STOP') === 0) {
+          setStatus('STOPPED');
         }
-        continue;
+        continue; // 数値は描画のみでログには出さない
       }
 
       // データ行 "t_ms,dist_mm"
@@ -146,7 +167,7 @@ async function startReaderLoop() {
       }
     }
   } catch (e) {
-    log(`# read error: ${e}`);
+    logDebug('# read error: ' + e);
   } finally {
     try { await reader?.cancel(); } catch {}
     reader = null;
@@ -158,12 +179,10 @@ btnConnect?.addEventListener('click', async () => {
     port = await navigator.serial.requestPort();
     await port.open({ baudRate: 115200, flowControl: 'none' });
 
-    // ★ 自動リセット対策：DTR/RTS を下げたまま固定
+    // 自動リセット対策：DTR/RTS を下げたまま
     if (port.setSignals) {
       await port.setSignals({ dataTerminalReady: false, requestToSend: false });
     }
-    // デバイス起動待ち
-    await new Promise(r => setTimeout(r, 300));
 
     writer = port.writable.getWriter();
     reading = true;
@@ -172,13 +191,11 @@ btnConnect?.addEventListener('click', async () => {
     records.length = 0;
     chart.data.datasets[0].data = [];
     chart.update('none');
+    setStatus('CONNECTING…');
 
-    log('# connected');
     startReaderLoop();
-
-    // 起動確認
+    // ハンドシェイク
     await sendLine('HELP');
-
   } catch (e) {
     alert('Serial接続に失敗: ' + e);
   }
@@ -191,7 +208,7 @@ btnDisconnect?.addEventListener('click', async () => {
   try { if (writer) { writer.releaseLock(); writer = null; } } catch {}
   try { if (port) await port.close(); } catch {}
   port = null;
-  log('# disconnected');
+  setStatus('DISCONNECTED');
 });
 
 btnStart?.addEventListener('click', async () => {
@@ -201,8 +218,7 @@ btnStart?.addEventListener('click', async () => {
   if (deviceReady) {
     await sendLine(`START hz=${lastHz}`);
   } else {
-    // READY が来たら自動で START する
-    log('# waiting READY...');
+    setStatus('WAITING READY…');
   }
 });
 
@@ -224,7 +240,7 @@ btnCsv?.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
-// Feature detection
+// ブラウザ対応チェック
 if (!('serial' in navigator)) {
-  alert('このブラウザはWeb Serialに対応していません。Chrome/Edge系の最新ブラウザをHTTPSでお試しください。');
+  alert('このブラウザはWeb Serialに対応していません。Chrome/Edge の最新を HTTPS でご利用ください。');
 }
