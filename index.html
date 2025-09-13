@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>VL53L0X Live Plot (CSV t_ms,mm 対応)</title>
+<title>VL53L0X Live Plot – mm固定 + 可変移動平均</title>
 <style>
   :root{ --h:60vh }
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;margin:16px}
@@ -17,21 +17,26 @@
   canvas{width:100%;height:100%;display:block}
   #log{margin-top:8px;color:#444;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;
        max-height:28vh;overflow:auto;border:1px solid #eee;padding:6px;border-radius:6px;background:#fafafa}
+  label span{opacity:.7;margin-right:4px}
 </style>
 </head>
 <body>
-<h1>VL53L0X Live Plot <small>stable-simple (CSV対応)</small></h1>
+<h1>VL53L0X Live Plot <small>mm固定 + 可変移動平均</small></h1>
 
 <div class="row">
   <button id="btnConnect">Connect</button>
   <button id="btnDisconnect">Disconnect</button>
-  <label>Hz:
+  <label><span>Hz</span>
     <input id="hzNum" type="number" value="50" min="1" max="50">
   </label>
   <button id="btnStart">Start</button>
   <button id="btnStop">Stop</button>
   <button id="btnReset">Reset</button>
   <button id="btnCsv">CSV</button>
+
+  <label><span>MA点数</span>
+    <input id="maNum" type="number" value="1" min="1" max="50" title="移動平均の点数 (1=生データ)">
+  </label>
   <span id="status">STOP</span>
 </div>
 
@@ -39,16 +44,17 @@
 <pre id="log"></pre>
 
 <script>
-/*** 簡易ログ ***/
+// --------- 簡易ログ ----------
 const logEl = document.getElementById('log');
 function log(...args){ const s=args.map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' ');
   logEl.textContent+=s+"\n"; logEl.scrollTop=logEl.scrollHeight; }
 function setStatus(s){ document.getElementById('status').textContent=s; }
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-/*** 要素 ***/
+// --------- 要素 ----------
 const cv=document.getElementById('cv'); const ctx=cv.getContext('2d');
 const hzNum=document.getElementById('hzNum');
+const maNum=document.getElementById('maNum');
 const btnConnect=document.getElementById('btnConnect');
 const btnDisconnect=document.getElementById('btnDisconnect');
 const btnStart=document.getElementById('btnStart');
@@ -56,13 +62,17 @@ const btnStop=document.getElementById('btnStop');
 const btnReset=document.getElementById('btnReset');
 const btnCsv=document.getElementById('btnCsv');
 
-/*** 状態 ***/
+// --------- 状態 ----------
 let port=null, reader=null, writer=null, reading=false;
-const rec=[]; // {t, cm}
+const rec=[];            // {t, cm}（描画用：フィルタ後）
+const rawRec=[];         // {t, cmRaw}（生）
 let yMax=100, xMax=10;
-let t0_ms=null; // デバイス側のt_msの初期値
+let t0_ms=null;
 
-/*** Canvas ***/
+// 移動平均用バッファ
+let maN=1, maQ=[], maSum=0;
+
+// --------- Canvas ----------
 const pad={l:56,r:14,t:12,b:28};
 function cssW(){return cv.getBoundingClientRect().width;}
 function cssH(){return cv.getBoundingClientRect().height;}
@@ -97,10 +107,13 @@ function draw(){
   ctx.stroke();
 }
 let rafId=null; function scheduleDraw(){ if(rafId) return; rafId=requestAnimationFrame(()=>{rafId=null; draw();}); }
-function resetPlotOnly(){ rec.length=0; yMax=100; xMax=10; t0_ms=null; scheduleDraw(); }
+function resetPlotOnly(){
+  rec.length=0; rawRec.length=0; maQ=[]; maSum=0;
+  yMax=100; xMax=10; t0_ms=null; scheduleDraw();
+}
 function updateAxes(t,cm){ if(cm>yMax) yMax=Math.ceil(cm/50)*50; if(t>xMax) xMax=Math.ceil(t/10)*10; }
 
-/*** 送受信 ***/
+// --------- 送受信 ----------
 async function sendLine(s){ if(!writer) return; log('> ', s); await writer.write(new TextEncoder().encode(s+"\n")); }
 class LineBreakTransformer{
   constructor(){ this.container=""; this.count=0; }
@@ -111,38 +124,39 @@ class LineBreakTransformer{
   flush(controller){ if(this.container){ controller.enqueue(this.container); this.container=""; } }
 }
 
-/*** 行パース（t_ms,dist_mm 対応） ***/
+// --------- 行パース（常に mm → cm） ----------
 function handleLine(line){
   const s=line.trim();
   if(/^#\s*start/i.test(s)){ setStatus('RUN'); return; }
   if(/^#\s*stop/i.test(s)){ setStatus('STOP'); return; }
-  if(/^#/.test(s)) return; // コメント行
+  if(/^#/.test(s)) return;
 
-  // 1) CSV: t,dist 形式
-  let m = s.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/);
-  if(m){
-    const t_ms=parseFloat(m[1]); const dist=parseFloat(m[2]);
-    if(!isFinite(t_ms)||!isFinite(dist)) return;
-    if(t0_ms===null) t0_ms=t_ms;
-    const t=(t_ms - t0_ms)/1000;                         // X軸はデバイスの時刻
-    // dist は mm か cm を自動判定（200を超えるならmmだったとみなす）
-    const cm = dist>200 ? dist/10 : dist;                // ←必要なら閾値を調整
-    if(cm<0 || cm>4000) return;                          // 異常値除外
-    rec.push({t,cm}); updateAxes(t,cm); scheduleDraw(); return;
+  // CSV "t_ms,dist_mm" 専用パーサ
+  const m = s.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/);
+  if(!m) return;
+
+  const t_ms=parseFloat(m[1]); const dist_mm=parseFloat(m[2]);
+  if(!isFinite(t_ms)||!isFinite(dist_mm)) return;
+
+  if(t0_ms===null) t0_ms=t_ms;
+  const t=(t_ms - t0_ms)/1000;                  // X軸：デバイスの時刻[s]
+  const cmRaw = dist_mm / 10;                   // ★ここを常に mm→cm に固定
+
+  rawRec.push({t, cmRaw});
+
+  // 可変移動平均（1なら生値）
+  maN = Math.max(1, Math.min(50, Number(maNum.value)||1));
+  maQ.push(cmRaw); maSum += cmRaw;
+  if(maQ.length > maN){ maSum -= maQ.shift(); }
+  const cm = (maN>1) ? (maSum / maQ.length) : cmRaw;
+
+  // 異常値の簡易除外（0<cm<4000）
+  if(cm>0 && cm<4000){
+    rec.push({t,cm}); updateAxes(t,cm); scheduleDraw();
   }
-
-  // 2) フォールバック：行内の最後の数値を距離として使う
-  const nums = s.match(/-?\d+(?:\.\d+)?/g);
-  if(!nums) return;
-  const n = parseFloat(nums[nums.length-1]);            // 最後の数値＝距離とみなす
-  if(!isFinite(n)) return;
-  const cm = n>200 ? n/10 : n;                          // mmなら/10
-  if(cm<0 || cm>4000) return;
-  const t = rec.length? rec[rec.length-1].t + (1/50) : 0; // 適当な刻み（50Hz想定）
-  rec.push({t,cm}); updateAxes(t,cm); scheduleDraw();
 }
 
-/*** UIイベント ***/
+// --------- UIイベント ----------
 btnConnect.addEventListener('click', async ()=>{
   try{
     if(!('serial' in navigator)) { alert('Web Serial未対応'); return; }
@@ -190,18 +204,21 @@ btnStop.addEventListener('click', async ()=>{
   setStatus('STOP'); log('STOP sent.');
 });
 
-btnReset.addEventListener('click', ()=>{ resetPlotOnly(); setStatus(reading?'RUN (RESET)':'RESET'); log('Plot reset.'); });
+btnReset.addEventListener('click', ()=>{
+  resetPlotOnly(); setStatus(reading?'RUN (RESET)':'RESET'); log('Plot reset.');
+});
 
 btnCsv.addEventListener('click', ()=>{
-  let csv="t_sec,cm\n"; for(const r of rec){ csv += `${r.t.toFixed(3)},${r.cm.toFixed(3)}\n`; }
+  let csv="t_sec,cm\n";
+  for(const r of rec){ csv += `${r.t.toFixed(3)},${r.cm.toFixed(3)}\n`; }
   const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob);
   const a=document.createElement('a'); a.href=url; a.download='vl53l0x_log.csv'; document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url); log('CSV downloaded. samples=',rec.length);
 });
 
-/*** 初期化 ***/
+// 初期化
 fitCanvas(); resetPlotOnly(); draw();
-log('Ready. Connect→Start。最初の20行はRXログに表示します。CSV形式 (t_ms,mm) に自動対応。');
+log('Ready. 受信は CSV: "t_ms,dist_mm" 前提。距離は mm→cm に固定変換します。移動平均は「MA点数」で変更(1=オフ)。');
 </script>
 </body>
 </html>
