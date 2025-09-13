@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>VL53L0X Live Plot (no libs)</title>
+<title>VL53L0X Live Plot (simple)</title>
 <style>
   :root{--h:60vh}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:16px}
@@ -12,7 +12,6 @@
   .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
   .row>*{height:32px}
   input[type="number"]{width:84px;padding:4px 6px}
-  select{height:32px}
   button{padding:6px 10px}
   #status{font-weight:700;margin-left:10px}
   #wrap{width:100%;height:var(--h);border:1px solid #ddd;border-radius:8px;overflow:hidden}
@@ -20,7 +19,7 @@
 </style>
 </head>
 <body>
-<h1>VL53L0X Live Plot <small>build: nolib-v1</small></h1>
+<h1>VL53L0X Live Plot <small>simple-noMA</small></h1>
 
 <div class="row">
   <button id="btnConnect">Connect</button>
@@ -28,18 +27,6 @@
 
   <label>Hz:
     <input id="hzNum" type="number" value="50" min="1" max="50">
-  </label>
-
-  <label>MA N:
-    <input id="maNum" type="number" value="5" min="1" max="50" step="1">
-  </label>
-
-  <label>表示:
-    <select id="modeSel">
-      <option value="ma" selected>MAのみ</option>
-      <option value="raw">RAWのみ</option>
-      <option value="both">両方</option>
-    </select>
   </label>
 
   <button id="btnStart">Start</button>
@@ -63,14 +50,13 @@ const el=id=>document.getElementById(id);
 const cv = el('cv'), ctx = cv.getContext('2d');
 const btnConnect=el('btnConnect'), btnDisconnect=el('btnDisconnect');
 const btnStart=el('btnStart'), btnStop=el('btnStop'), btnReset=el('btnReset');
-const btnCsv=el('btnCsv'), hzNum=el('hzNum'), maNum=el('maNum'), modeSel=el('modeSel'), statusEl=el('status');
+const btnCsv=el('btnCsv'), hzNum=el('hzNum'), statusEl=el('status');
 
 /* ===== 状態 ===== */
 let port=null, reader=null, writer=null, reading=false;
 let t0=0, rafId=null;
-const rec=[]; // {t, raw, ma}
+const rec=[]; // {t, cm}
 let yMax=100, xMax=10;
-let maN=5, maBuf=[];
 
 /* ===== Canvas リサイズ ===== */
 function fitCanvas(){
@@ -97,9 +83,8 @@ function drawAxes(){
   // 背景
   ctx.fillStyle="#fff"; ctx.fillRect(0,0,w,h);
 
-  // 目盛
+  // グリッド
   ctx.strokeStyle="#eee"; ctx.lineWidth=1;
-  // yグリッド（10分割目安）
   const yStep=Math.max(10, Math.round(yMax/10/10)*10 || 10);
   for(let y=0;y<=yMax;y+=yStep){
     const py=y2px(y);
@@ -107,43 +92,28 @@ function drawAxes(){
     ctx.fillStyle="#666"; ctx.font="12px system-ui";
     ctx.fillText(String(y), 8, py+4);
   }
-  // xグリッド
   const xStep = Math.max(1, xMax/10);
   for(let x=0;x<=xMax;x+=xStep){
     const px=x2px(x);
     ctx.beginPath(); ctx.moveTo(px,pad.t); ctx.lineTo(px,h-pad.b); ctx.stroke();
   }
-
   // 軸ラベル
   ctx.fillStyle="#000"; ctx.font="12px system-ui";
   ctx.fillText("Distance [cm]", 8, 14);
   ctx.fillText("Time [s]", w-60, h-6);
 }
 
-function drawLine(points, color, width){
-  if(points.length<2) return;
-  ctx.strokeStyle=color; ctx.lineWidth=width; ctx.beginPath();
-  ctx.moveTo(x2px(points[0].x), y2px(points[0].y));
-  for(let i=1;i<points.length;i++){
-    const p=points[i];
-    ctx.lineTo(x2px(p.x), y2px(p.y));
-  }
-  ctx.stroke();
-}
-
 function draw(){
   drawAxes();
-  // 表示モード
-  const mode = modeSel.value;
-  if(mode!=='ma'){
-    // RAW
-    const rawPts = rec.map(r=>({x:r.t,y:r.raw}));
-    drawLine(rawPts, "rgba(0,0,0,0.45)", 1.2);
+  if(rec.length<2) return;
+  ctx.strokeStyle="#1f77b4"; ctx.lineWidth=2;
+  ctx.beginPath();
+  ctx.moveTo(x2px(rec[0].t), y2px(rec[0].cm));
+  for(let i=1;i<rec.length;i++){
+    const r=rec[i];
+    ctx.lineTo(x2px(r.t), y2px(r.cm));
   }
-  if(mode!=='raw'){
-    const maPts  = rec.map(r=>({x:r.t,y:r.ma}));
-    drawLine(maPts, "#1f77b4", 2.0);
-  }
+  ctx.stroke();
 }
 
 function scheduleDraw(){
@@ -151,26 +121,12 @@ function scheduleDraw(){
   rafId = requestAnimationFrame(()=>{ rafId=null; draw(); });
 }
 
-/* ===== 処理 ===== */
+/* ===== ユーティリティ ===== */
 function setStatus(s){ statusEl.textContent=s; }
-
 function resetPlotOnly(){
-  rec.length=0; maBuf.length=0; yMax=100; xMax=10; t0=performance.now();
+  rec.length=0; yMax=100; xMax=10; t0=performance.now();
   scheduleDraw();
 }
-
-function sma(v){
-  maBuf.push(v); if(maBuf.length>maN) maBuf.shift();
-  let s=0; for(let i=0;i<maBuf.length;i++) s+=maBuf[i];
-  return s/maBuf.length;
-}
-
-function recomputeMA(){
-  maBuf.length=0;
-  for(const r of rec){ r.ma = sma(r.raw); }
-  scheduleDraw();
-}
-
 function updateAxes(t,cm){
   if(cm>yMax){ yMax = Math.ceil(cm/50)*50; }
   if(t>xMax){ xMax = Math.ceil(t/10)*10; }
@@ -195,14 +151,13 @@ class LineBreakTransformer{
 
 function handleLine(line){
   const s=line.trim();
-  // 数字一行（mm）だけ採用
+  // 数字一行（mm）だけ採用。ESP-ROM行などは無視
   if(!/^-?\d+(\.\d+)?$/.test(s)) return;
   const mm=Number(s);
   if(!isFinite(mm) || mm<0 || mm>4000) return; // 0〜4m 以外は捨てる
   const cm=mm/10;
   const t=(performance.now()-t0)/1000;
-  const ma=sma(cm);
-  rec.push({t,raw:cm,ma});
+  rec.push({t,cm});
   updateAxes(t,cm);
   scheduleDraw();
 }
@@ -236,12 +191,16 @@ async function stopReading(){
 /* ===== イベント ===== */
 btnConnect.addEventListener('click', async ()=>{
   try{
-    port=await navigator.serial.requestPort();
+    port=await navigator.serial.requestPort();           // 必ずユーザー操作内で呼ぶ
     await port.open({baudRate:115200});
     writer=port.writable.getWriter();
     setStatus('CONNECTED');
-  }catch(e){ alert('Serial接続に失敗: '+e); }
+  }catch(e){
+    console.error(e);
+    alert('Serial接続に失敗: '+e);
+  }
 });
+
 btnDisconnect.addEventListener('click', async ()=>{
   try{ await sendLine('STOP'); }catch(_){}
   await stopReading();
@@ -249,6 +208,7 @@ btnDisconnect.addEventListener('click', async ()=>{
   try{ if(port) await port.close(); }catch(_){}
   port=null; setStatus('DISCONNECTED');
 });
+
 btnStart.addEventListener('click', async ()=>{
   if(!port){ alert('先にConnectしてください'); return; }
   const hz=Math.max(1,Math.min(50, Number(hzNum.value)||50));
@@ -256,25 +216,23 @@ btnStart.addEventListener('click', async ()=>{
   await sendLine(`START hz=${hz}`);
   startReading();
 });
+
 btnStop.addEventListener('click', async ()=>{
   await sendLine('STOP'); await stopReading();
 });
+
 btnReset.addEventListener('click', ()=>{
   resetPlotOnly(); setStatus(reading ? 'RUN (RESET)' : 'RESET');
 });
+
 btnCsv.addEventListener('click', ()=>{
-  let csv="t_sec,raw_cm,ma_cm\n";
-  for(const r of rec){ csv+=`${r.t.toFixed(3)},${r.raw.toFixed(3)},${r.ma.toFixed(3)}\n`; }
+  let csv="t_sec,cm\n";
+  for(const r of rec){ csv+=`${r.t.toFixed(3)},${r.cm.toFixed(3)}\n`; }
   const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a'); a.href=url; a.download='vl53l0x_log.csv';
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
 });
-maNum.addEventListener('change', ()=>{
-  const n=Math.max(1,Math.min(50, Number(maNum.value)||5));
-  maN=n; maNum.value=n; recomputeMA();
-});
-modeSel.addEventListener('change', draw);
 
 /* 初期描画 */
 resetPlotOnly(); draw();
