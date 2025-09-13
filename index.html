@@ -3,52 +3,42 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>VL53L0X Logger (Web Serial)</title>
+  <title>VL53L0X Live Plot</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 16px; }
-    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
-    input[type="number"] { width: 7rem; padding: 6px; }
-    button { padding: 8px 12px; cursor: pointer; }
-    #status { margin: 8px 0; color: #333; white-space: pre-wrap; }
-    #log { height: 200px; overflow: auto; background:#f7f7f7; border:1px solid #ddd; padding:8px; font-family: ui-monospace, monospace; }
-    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
-    th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: right; }
-    th { background: #fafafa; }
-    #chartWrap { height: 320px; border:1px solid #ddd; padding:8px; margin-top:8px; }
-    #chart { width: 100%; height: 100%; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    #wrap { position: relative; width: 100%; height: 420px; }
+    #chart { position: absolute; inset: 0; }  /* Chart.js は親の高さに合わせる */
+    /* ログは画面に出さない（デバッグ用に残すが非表示） */
+    #log { display: none; }
+    button, input { font-size: 14px; padding: 6px 10px; }
+    input[type="number"] { width: 6rem; }
   </style>
 </head>
 <body>
-  <h1>VL53L0X Logger</h1>
+  <h1>VL53L0X Live Plot</h1>
 
   <div class="row">
     <button id="btnConnect">Connect</button>
     <button id="btnDisconnect">Disconnect</button>
-    <span id="status">Not connected</span>
+    <label>Hz:
+      <input id="hzNum" type="number" min="1" max="50" step="1" value="50" />
+    </label>
+    <button id="btnStart">Start</button>
+    <button id="btnStop">Stop</button>
+    <button id="btnCsv">CSV</button>
+    <span id="status" aria-live="polite" style="margin-left:8px;color:#555;"></span>
   </div>
 
-  <div class="row">
-    <label>Rate (Hz): <input id="hzNum" type="number" min="1" max="50" step="1" value="50"></label>
-    <button id="btnRate">Apply RATE</button>
-    <button id="btnStart">START</button>
-    <button id="btnStop">STOP</button>
-    <button id="btnCsv">CSV Export</button>
-    <button id="btnClear">Clear</button>
-  </div>
-
-  <div id="chartWrap">
+  <div id="wrap">
     <canvas id="chart"></canvas>
   </div>
 
-  <div id="log"></div>
+  <pre id="log"></pre>
 
-  <table id="tbl">
-    <thead><tr><th style="text-align:left;">Time (ms)</th><th>Distance (mm)</th></tr></thead>
-    <tbody></tbody>
-  </table>
-
-  <!-- Chart.js（CDN） -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-  <script src="./app.js" defer></script>
+  <!-- Chart.js（必須） -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- アプリ本体 -->
+  <script src="app.js"></script>
 </body>
 </html>
