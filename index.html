@@ -3,11 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>VL53L0X Live Plot</title>
-
-<!-- 同梱したChart.jsを読み込み（CDNは使いません） -->
-<script src="./chart.umd.min.js"></script>
-
+<title>VL53L0X Live Plot (no libs)</title>
 <style>
   :root{--h:60vh}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:16px}
@@ -19,127 +15,168 @@
   select{height:32px}
   button{padding:6px 10px}
   #status{font-weight:700;margin-left:10px}
-  #chartWrap{width:100%;height:var(--h)}
-  canvas{width:100%!important;height:100%!important}
+  #wrap{width:100%;height:var(--h);border:1px solid #ddd;border-radius:8px;overflow:hidden}
+  canvas{width:100%;height:100%}
 </style>
 </head>
 <body>
-  <h1>VL53L0X Live Plot <small>build: v3-local</small></h1>
+<h1>VL53L0X Live Plot <small>build: nolib-v1</small></h1>
 
-  <div class="row">
-    <button id="btnConnect">Connect</button>
-    <button id="btnDisconnect">Disconnect</button>
+<div class="row">
+  <button id="btnConnect">Connect</button>
+  <button id="btnDisconnect">Disconnect</button>
 
-    <label>Hz:
-      <input id="hzNum" type="number" value="50" min="1" max="50">
-    </label>
+  <label>Hz:
+    <input id="hzNum" type="number" value="50" min="1" max="50">
+  </label>
 
-    <label>MA N:
-      <input id="maNum" type="number" value="5" min="1" max="50" step="1">
-    </label>
+  <label>MA N:
+    <input id="maNum" type="number" value="5" min="1" max="50" step="1">
+  </label>
 
-    <label>表示:
-      <select id="modeSel">
-        <option value="ma" selected>MAのみ</option>
-        <option value="raw">RAWのみ</option>
-        <option value="both">両方</option>
-      </select>
-    </label>
+  <label>表示:
+    <select id="modeSel">
+      <option value="ma" selected>MAのみ</option>
+      <option value="raw">RAWのみ</option>
+      <option value="both">両方</option>
+    </select>
+  </label>
 
-    <button id="btnStart">Start</button>
-    <button id="btnStop">Stop</button>
-    <button id="btnReset">Reset</button>
-    <button id="btnCsv">CSV</button>
+  <button id="btnStart">Start</button>
+  <button id="btnStop">Stop</button>
+  <button id="btnReset">Reset</button>
+  <button id="btnCsv">CSV</button>
 
-    <span id="status">STOP</span>
-  </div>
+  <span id="status">STOP</span>
+</div>
 
-  <div id="chartWrap">
-    <canvas id="chart"></canvas>
-  </div>
+<div id="wrap"><canvas id="cv"></canvas></div>
 
 <script>
-/* ======= 早期チェック ======= */
+/* ===== 早期チェック ===== */
 if(!('serial' in navigator)){
-  alert('このブラウザはWeb Serialに対応していません。Chrome/EdgeをHTTPSでお使いください。');
-}
-if(!window.Chart){
-  alert('同梱の chart.umd.min.js を読み込めませんでした。配置場所やファイル名を確認してください。');
-  throw new Error('Chart.js not loaded');
+  alert('このブラウザはWeb Serialに未対応です。Chrome/EdgeをHTTPSでお使いください。');
 }
 
-/* ======= 参照取得 ======= */
-const el = (id)=>document.getElementById(id);
+/* ===== 参照 ===== */
+const el=id=>document.getElementById(id);
+const cv = el('cv'), ctx = cv.getContext('2d');
 const btnConnect=el('btnConnect'), btnDisconnect=el('btnDisconnect');
 const btnStart=el('btnStart'), btnStop=el('btnStop'), btnReset=el('btnReset');
 const btnCsv=el('btnCsv'), hzNum=el('hzNum'), maNum=el('maNum'), modeSel=el('modeSel'), statusEl=el('status');
 
-/* ======= 状態 ======= */
+/* ===== 状態 ===== */
 let port=null, reader=null, writer=null, reading=false;
-let t0=0;
-const rec=[]; // {t,raw,ma}
+let t0=0, rafId=null;
+const rec=[]; // {t, raw, ma}
 let yMax=100, xMax=10;
 let maN=5, maBuf=[];
 
-/* ======= Chart.js 準備 ======= */
-function makeChart(){
-  const ctx = el('chart').getContext('2d');
-  const datasetRaw={label:'RAW (cm)',data:[],borderWidth:1.5,pointRadius:0,tension:0};
-  const datasetMA ={label:`MA${maN} (cm)`,data:[],borderWidth:2,pointRadius:0,tension:0};
-  const chart=new Chart(ctx,{
-    type:'line',
-    data:{datasets:[datasetMA,datasetRaw]},
-    options:{
-      animation:false,responsive:true,maintainAspectRatio:false,parsing:false,
-      scales:{x:{type:'linear',title:{display:true,text:'Time [s]'},min:0,max:xMax},
-              y:{title:{display:true,text:'Distance [cm]'},min:0,max:yMax}},
-      plugins:{legend:{display:true}}
-    }
-  });
-  return {chart,datasetRaw,datasetMA};
+/* ===== Canvas リサイズ ===== */
+function fitCanvas(){
+  const rect=cv.parentElement.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  cv.width=Math.floor(rect.width*dpr);
+  cv.height=Math.floor(rect.height*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  draw();
 }
-const {chart,datasetRaw,datasetMA}=makeChart();
+addEventListener('resize', fitCanvas);
+fitCanvas();
 
-function setMode(){
-  const v=modeSel.value;
-  datasetMA.hidden = (v==='raw');
-  datasetRaw.hidden= (v==='ma');
-  chart.update();
+/* ===== 軸・座標変換 ===== */
+const pad={l:52,r:12,t:12,b:28};
+function x2px(x){ const w=cv.clientWidth-pad.l-pad.r; return pad.l + x/xMax*w; }
+function y2px(y){ const h=cv.clientHeight-pad.t-pad.b; return pad.t + (1-y/yMax)*h; }
+
+/* ===== 描画 ===== */
+function drawAxes(){
+  const w=cv.clientWidth, h=cv.clientHeight;
+  ctx.clearRect(0,0,w,h);
+
+  // 背景
+  ctx.fillStyle="#fff"; ctx.fillRect(0,0,w,h);
+
+  // 目盛
+  ctx.strokeStyle="#eee"; ctx.lineWidth=1;
+  // yグリッド（10分割目安）
+  const yStep=Math.max(10, Math.round(yMax/10/10)*10 || 10);
+  for(let y=0;y<=yMax;y+=yStep){
+    const py=y2px(y);
+    ctx.beginPath(); ctx.moveTo(pad.l,py); ctx.lineTo(w-pad.r,py); ctx.stroke();
+    ctx.fillStyle="#666"; ctx.font="12px system-ui";
+    ctx.fillText(String(y), 8, py+4);
+  }
+  // xグリッド
+  const xStep = Math.max(1, xMax/10);
+  for(let x=0;x<=xMax;x+=xStep){
+    const px=x2px(x);
+    ctx.beginPath(); ctx.moveTo(px,pad.t); ctx.lineTo(px,h-pad.b); ctx.stroke();
+  }
+
+  // 軸ラベル
+  ctx.fillStyle="#000"; ctx.font="12px system-ui";
+  ctx.fillText("Distance [cm]", 8, 14);
+  ctx.fillText("Time [s]", w-60, h-6);
 }
 
-/* ======= グラフ＆MA ======= */
+function drawLine(points, color, width){
+  if(points.length<2) return;
+  ctx.strokeStyle=color; ctx.lineWidth=width; ctx.beginPath();
+  ctx.moveTo(x2px(points[0].x), y2px(points[0].y));
+  for(let i=1;i<points.length;i++){
+    const p=points[i];
+    ctx.lineTo(x2px(p.x), y2px(p.y));
+  }
+  ctx.stroke();
+}
+
+function draw(){
+  drawAxes();
+  // 表示モード
+  const mode = modeSel.value;
+  if(mode!=='ma'){
+    // RAW
+    const rawPts = rec.map(r=>({x:r.t,y:r.raw}));
+    drawLine(rawPts, "rgba(0,0,0,0.45)", 1.2);
+  }
+  if(mode!=='raw'){
+    const maPts  = rec.map(r=>({x:r.t,y:r.ma}));
+    drawLine(maPts, "#1f77b4", 2.0);
+  }
+}
+
+function scheduleDraw(){
+  if(rafId) return;
+  rafId = requestAnimationFrame(()=>{ rafId=null; draw(); });
+}
+
+/* ===== 処理 ===== */
+function setStatus(s){ statusEl.textContent=s; }
+
 function resetPlotOnly(){
-  rec.length=0; datasetRaw.data.length=0; datasetMA.data.length=0; maBuf.length=0;
-  yMax=100; xMax=10;
-  chart.options.scales.y.max=yMax; chart.options.scales.x.max=xMax;
-  datasetMA.label=`MA${maN} (cm)`;
-  t0=performance.now();
-  chart.update();
+  rec.length=0; maBuf.length=0; yMax=100; xMax=10; t0=performance.now();
+  scheduleDraw();
 }
-function updateAxes(t,cm){
-  if(cm>yMax){ yMax=Math.ceil(cm/50)*50; chart.options.scales.y.max=yMax; }
-  if(t>xMax){ xMax=Math.ceil(t/10)*10;   chart.options.scales.x.max=xMax; }
-}
-function addPoint(t,raw,ma){
-  datasetRaw.data.push({x:t,y:raw});
-  datasetMA.data.push({x:t,y:ma});
-  chart.update('none');
-}
+
 function sma(v){
   maBuf.push(v); if(maBuf.length>maN) maBuf.shift();
   let s=0; for(let i=0;i<maBuf.length;i++) s+=maBuf[i];
   return s/maBuf.length;
 }
+
 function recomputeMA(){
   maBuf.length=0;
-  datasetMA.data.length=0;
-  for(const r of rec){ r.ma=sma(r.raw); datasetMA.data.push({x:r.t,y:r.ma}); }
-  datasetMA.label=`MA${maN} (cm)`; chart.update();
+  for(const r of rec){ r.ma = sma(r.raw); }
+  scheduleDraw();
 }
 
-/* ======= Web Serial ======= */
-function setStatus(s){ statusEl.textContent=s; }
+function updateAxes(t,cm){
+  if(cm>yMax){ yMax = Math.ceil(cm/50)*50; }
+  if(t>xMax){ xMax = Math.ceil(t/10)*10; }
+}
 
+/* ===== Web Serial ===== */
 async function sendLine(s){
   if(!writer) return;
   await writer.write(new TextEncoder().encode(s+"\n"));
@@ -151,23 +188,23 @@ class LineBreakTransformer{
     this.container+=chunk;
     const lines=this.container.split(/\r?\n/);
     this.container=lines.pop();
-    for(const line of lines) controller.enqueue(line);
+    for(const l of lines) controller.enqueue(l);
   }
   flush(controller){ if(this.container) controller.enqueue(this.container); }
 }
 
 function handleLine(line){
   const s=line.trim();
-  // 数字の行だけ採用（mm）
+  // 数字一行（mm）だけ採用
   if(!/^-?\d+(\.\d+)?$/.test(s)) return;
   const mm=Number(s);
-  if(!isFinite(mm) || mm<0 || mm>4000) return;
+  if(!isFinite(mm) || mm<0 || mm>4000) return; // 0〜4m 以外は捨てる
   const cm=mm/10;
   const t=(performance.now()-t0)/1000;
   const ma=sma(cm);
   rec.push({t,raw:cm,ma});
   updateAxes(t,cm);
-  addPoint(t,cm,ma);
+  scheduleDraw();
 }
 
 async function startReading(){
@@ -196,7 +233,7 @@ async function stopReading(){
   setStatus('STOP');
 }
 
-/* ======= イベント ======= */
+/* ===== イベント ===== */
 btnConnect.addEventListener('click', async ()=>{
   try{
     port=await navigator.serial.requestPort();
@@ -237,11 +274,10 @@ maNum.addEventListener('change', ()=>{
   const n=Math.max(1,Math.min(50, Number(maNum.value)||5));
   maN=n; maNum.value=n; recomputeMA();
 });
-modeSel.addEventListener('change', setMode);
+modeSel.addEventListener('change', draw);
 
-/* 初期設定 */
-setMode();
-resetPlotOnly();
+/* 初期描画 */
+resetPlotOnly(); draw();
 </script>
 </body>
 </html>
