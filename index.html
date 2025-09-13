@@ -4,19 +4,10 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>VL53L0X Live Plot</title>
-<!-- Chart.js（CDN → フォールバック） -->
-<script>
-(function(){
-  function load(src, onload, onerror){
-    var s=document.createElement('script'); s.src=src; s.onload=onload; s.onerror=onerror; document.head.appendChild(s);
-  }
-  load(
-    "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js",
-    null,
-    function(){ load("https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js"); }
-  );
-})();
-</script>
+
+<!-- 同梱したChart.jsを読み込み（CDNは使いません） -->
+<script src="./chart.umd.min.js"></script>
+
 <style>
   :root{--h:60vh}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:16px}
@@ -33,7 +24,7 @@
 </style>
 </head>
 <body>
-  <h1>VL53L0X Live Plot <small>build: 2025-09-13 v2</small></h1>
+  <h1>VL53L0X Live Plot <small>build: v3-local</small></h1>
 
   <div class="row">
     <button id="btnConnect">Connect</button>
@@ -72,6 +63,10 @@
 if(!('serial' in navigator)){
   alert('このブラウザはWeb Serialに対応していません。Chrome/EdgeをHTTPSでお使いください。');
 }
+if(!window.Chart){
+  alert('同梱の chart.umd.min.js を読み込めませんでした。配置場所やファイル名を確認してください。');
+  throw new Error('Chart.js not loaded');
+}
 
 /* ======= 参照取得 ======= */
 const el = (id)=>document.getElementById(id);
@@ -87,14 +82,7 @@ let yMax=100, xMax=10;
 let maN=5, maBuf=[];
 
 /* ======= Chart.js 準備 ======= */
-function ensureChartJS(){
-  if(!window.Chart){
-    alert('Chart.js が読み込めませんでした。ネットワークまたはCDNブロックをご確認ください。');
-    throw new Error('Chart.js not loaded');
-  }
-}
 function makeChart(){
-  ensureChartJS();
   const ctx = el('chart').getContext('2d');
   const datasetRaw={label:'RAW (cm)',data:[],borderWidth:1.5,pointRadius:0,tension:0};
   const datasetMA ={label:`MA${maN} (cm)`,data:[],borderWidth:2,pointRadius:0,tension:0};
