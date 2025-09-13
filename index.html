@@ -10,6 +10,7 @@
   .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
   .row>*{height:32px}
   input[type="number"]{width:80px;padding:4px 6px}
+  select{height:32px}
   button{padding:6px 10px}
   #status{font-weight:700;margin-left:8px}
   #chartWrap{width:100%;height:62vh}
@@ -27,6 +28,18 @@
       <input id="hzNum" type="number" value="50" min="1" max="50">
     </label>
 
+    <label>MA N:
+      <input id="maNum" type="number" value="5" min="1" max="50" step="1" />
+    </label>
+
+    <label>表示:
+      <select id="modeSel">
+        <option value="ma">移動平均のみ</option>
+        <option value="raw">生データのみ</option>
+        <option value="both">両方</option>
+      </select>
+    </label>
+
     <button id="btnStart">Start</button>
     <button id="btnStop">Stop</button>
     <button id="btnReset">Reset</button>
@@ -40,64 +53,95 @@
   </div>
 
 <script>
-/* ====================== 基本設定 ====================== */
+/* ====================== 状態変数 ====================== */
 let port=null, reader=null, writer=null, reading=false;
 let t0=0;
-const records=[];                 // {t:sec, y:cm, raw:mm}
-const MA_N=5;                     // 5点移動平均
-let maBuf=[];                     // 平滑用バッファ
-let yMax=100;                     // 初期Y上限 100cm
-let xMax=10;                      // 初期X上限 10s
+const records=[];   // {t:sec, raw:cm, ma:cm}
+let yMax=100;       // Y軸初期上限 100cm
+let xMax=10;        // X軸初期上限 10s
+let maN=5;          // 移動平均点数
+let maBuf=[];       // MA用リングバッファ
 
-/* ====================== Chart.js ====================== */
+/* ====================== Chart.js 準備 ====================== */
 const ctx=document.getElementById('chart').getContext('2d');
+const datasetRaw={
+  label:'RAW (cm)',
+  data:[],                  // {x,y}
+  borderWidth:1.5,
+  pointRadius:0,
+  tension:0
+};
+const datasetMA={
+  label:`MA${maN} (cm)`,
+  data:[],
+  borderWidth:2,
+  pointRadius:0,
+  tension:0
+};
 const chart=new Chart(ctx,{
   type:'line',
-  data:{ datasets:[{
-    label:'Distance (cm)',
-    data:[],              // {x:sec, y:cm}
-    borderWidth:2,
-    pointRadius:0,
-    tension:0
-  }]},
+  data:{datasets:[datasetMA,datasetRaw]}, // デフォルトはMAのみ表示
   options:{
     animation:false,
     responsive:true,
     maintainAspectRatio:false,
-    parsing:false,        // {x,y}オブジェクトをそのまま使う
+    parsing:false, // {x,y}オブジェクトをそのまま使う
     scales:{
       x:{type:'linear',title:{display:true,text:'Time [s]'},min:0,max:xMax},
       y:{title:{display:true,text:'Distance [cm]'},min:0,max:yMax}
     },
-    plugins:{legend:{display:false}}
+    plugins:{
+      legend:{display:true},
+      decimation:{enabled:false}
+    }
   }
 });
+function applyMode(){
+  const mode=document.getElementById('modeSel').value;
+  if(mode==='ma'){ datasetMA.hidden=false; datasetRaw.hidden=true; }
+  else if(mode==='raw'){ datasetMA.hidden=true; datasetRaw.hidden=false; }
+  else { datasetMA.hidden=false; datasetRaw.hidden=false; }
+  chart.update();
+}
 function updateAxesIfNeeded(t,cm){
   if(cm>yMax){ yMax=Math.ceil(cm/50)*50; chart.options.scales.y.max=yMax; }
   if(t>xMax){ xMax=Math.ceil(t/10)*10;   chart.options.scales.x.max=xMax; }
 }
-function addPoint(t,cm){
-  chart.data.datasets[0].data.push({x:t,y:cm});
+function addPoints(t,raw,ma){
+  if(!Number.isFinite(raw)) return;
+  datasetRaw.data.push({x:t,y:raw});
+  if(Number.isFinite(ma)) datasetMA.data.push({x:t,y:ma});
   chart.update('none');
 }
-function resetAll(){
+function resetPlotOnly(){
   records.length=0;
-  chart.data.datasets[0].data.length=0;
+  datasetRaw.data.length=0;
+  datasetMA.data.length=0;
   maBuf.length=0;
   yMax=100; xMax=10;
   chart.options.scales.y.max=yMax;
   chart.options.scales.x.max=xMax;
   t0=performance.now();
+  datasetMA.label=`MA${maN} (cm)`;
   chart.update();
-  setStatus('RESET');
 }
 
-/* ====================== 移動平均（5点） ====================== */
-function sma5(v){
+/* ====================== 移動平均 ====================== */
+function sma(v){
   maBuf.push(v);
-  if(maBuf.length>MA_N) maBuf.shift();
+  if(maBuf.length>maN) maBuf.shift();
   let s=0; for(let i=0;i<maBuf.length;i++) s+=maBuf[i];
   return s/maBuf.length;
+}
+function recomputeMAForAll(){
+  maBuf.length=0;
+  datasetMA.data.length=0;
+  for(const r of records){
+    r.ma=sma(r.raw);
+    datasetMA.data.push({x:r.t,y:r.ma});
+  }
+  datasetMA.label=`MA${maN} (cm)`;
+  chart.update();
 }
 
 /* ====================== Web Serial ====================== */
@@ -108,6 +152,8 @@ const btnStop=document.getElementById('btnStop');
 const btnReset=document.getElementById('btnReset');
 const btnCsv=document.getElementById('btnCsv');
 const hzNum=document.getElementById('hzNum');
+const maNum=document.getElementById('maNum');
+const modeSel=document.getElementById('modeSel');
 const statusEl=document.getElementById('status');
 
 function setStatus(s){ statusEl.textContent=s; }
@@ -117,8 +163,6 @@ async function sendLine(s){
   const enc=new TextEncoder().encode(s+"\n");
   await writer.write(enc);
 }
-
-// 行分割用
 class LineBreakTransformer{
   constructor(){ this.container=""; }
   transform(chunk,controller){
@@ -130,25 +174,27 @@ class LineBreakTransformer{
   flush(controller){ if(this.container) controller.enqueue(this.container); }
 }
 
-/* 文字が混じる行は無視。完全に数値だけ（mm想定）の行のみ採用 */
+/* 数字だけの行（mm）を採用 */
 function processLine(line){
   const s=line.trim();
-  if(!/^-?\d+(?:\.\d+)?$/.test(s)) return;  // 数値オンリー以外は捨てる
-
+  if(!/^-?\d+(?:\.\d+)?$/.test(s)) return;
   const mm=parseFloat(s);
-  if(!isFinite(mm) || mm<0 || mm>4000) return; // センサ範囲外は捨てる
-  const cmRaw=mm/10;
-  const cm=sma5(cmRaw);                       // 5点移動平均
+  if(!isFinite(mm) || mm<0 || mm>4000) return;
+
+  const raw=mm/10;            // cm
+  const ma=sma(raw);
   const t=(performance.now()-t0)/1000;
 
-  records.push({t,y:cm,raw:mm});
-  updateAxesIfNeeded(t,cm);
-  addPoint(t,cm);
+  records.push({t,raw,ma});
+  updateAxesIfNeeded(t, raw);
+  addPoints(t, raw, ma);
 }
 
 async function startReading(){
   if(!port || reading) return;
-  reading=true; t0=performance.now(); setStatus('RUN');
+  reading=true;
+  setStatus('RUN');           // ← Start時に必ずRUNを表示
+  t0=performance.now();
 
   const textDecoder=new TextDecoderStream();
   const closedReadable=port.readable.pipeTo(textDecoder.writable).catch(()=>{});
@@ -174,7 +220,7 @@ async function stopReading(){
   setStatus('STOP');
 }
 
-/* ====================== UI ====================== */
+/* ====================== UIイベント ====================== */
 btnConnect.addEventListener('click',async()=>{
   try{
     port=await navigator.serial.requestPort();
@@ -196,8 +242,8 @@ btnDisconnect.addEventListener('click',async()=>{
 btnStart.addEventListener('click',async()=>{
   if(!port){ alert('先にConnectしてください'); return; }
   const hz=Math.max(1,Math.min(50,Number(hzNum.value)||50));
+  resetPlotOnly();                 // グラフ/バッファだけ初期化
   await sendLine(`START hz=${hz}`);
-  resetAll();            // 新規セッションとしてクリア
   startReading();
 });
 
@@ -207,12 +253,13 @@ btnStop.addEventListener('click',async()=>{
 });
 
 btnReset.addEventListener('click',()=>{
-  resetAll();
+  resetPlotOnly();                 // 読み取りは続行
+  setStatus(reading ? 'RUN (RESET)' : 'RESET');
 });
 
 btnCsv.addEventListener('click',()=>{
-  let csv="t_sec,cm\n";
-  for(const r of records) csv+=`${r.t.toFixed(3)},${r.y.toFixed(3)}\n`;
+  let csv="t_sec,raw_cm,ma_cm\n";
+  for(const r of records) csv+=`${r.t.toFixed(3)},${(r.raw??'').toFixed(3)},${(r.ma??'').toFixed(3)}\n`;
   const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
@@ -221,11 +268,20 @@ btnCsv.addEventListener('click',()=>{
   URL.revokeObjectURL(url);
 });
 
+maNum.addEventListener('change',()=>{
+  const n=Math.max(1,Math.min(50,Number(maNum.value)||5));
+  maN=n; maNum.value=n;
+  recomputeMAForAll();
+});
+
+modeSel.addEventListener('change',applyMode);
+
 /* ====================== 初期チェック ====================== */
 if(!('serial' in navigator)){
   alert('このブラウザはWeb Serialに対応していません。Chrome/EdgeのHTTPSでお試しください。');
 }
-resetAll();
+applyMode();         // 初期: 移動平均のみ
+resetPlotOnly();     // 軸を初期化
 </script>
 </body>
 </html>
