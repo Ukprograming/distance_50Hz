@@ -1,11 +1,9 @@
-
 <!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>VL53L0X Live Plot</title>
-<!-- favicon 404回避 -->
+<title>VL53L0X Live Plot (RAW)</title>
 <link rel="icon" href="data:,">
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; }
@@ -14,6 +12,7 @@
   .toolbar input { width:90px; padding:4px 6px; }
   .toolbar button { padding:6px 10px; }
   #status { margin-left: 8px; font-weight: 600; }
+  #env { font-size:12px; color:#0369a1; margin:6px 0 10px }
   #chartWrap { width:100%; height: 520px; }
   canvas { width:100% !important; height:100% !important; }
 </style>
@@ -34,57 +33,85 @@
     <span id="status">STOPPED</span>
   </div>
 
+  <div id="env"></div>
   <div id="chartWrap"><canvas id="chart"></canvas></div>
+
+  <details>
+    <summary>Debug demo（テスト用・必要なときだけ開いてください）</summary>
+    <div class="toolbar">
+      Demo: <select id="demo">
+        <option value="off">off</option>
+        <option value="flat500">flat 500mm</option>
+        <option value="step">step 200→1300mm</option>
+        <option value="noisy">noisy 800±50mm</option>
+      </select>
+      <button id="btnDemoRun">Run</button>
+      <button id="btnDemoStop">Stop</button>
+    </div>
+  </details>
 
 <script>
 (() => {
-  // ====== Chart.js 初期化 ======
+  // ====== Environment preflight (SecurityError対策) ======
+  function checkEnvForSerial() {
+    const msgs = [];
+    if (!('serial' in navigator)) msgs.push('Web Serial未対応（Chrome/Edgeのデスクトップが必要）。');
+    if (!window.isSecureContext) msgs.push('HTTPS または localhost で開いてください。');
+    try { if (window.self !== window.top) msgs.push('iframe埋め込みでは親側に allow="serial" が必要です。'); } catch(_) {}
+    try {
+      if ('permissionsPolicy' in document && typeof document.permissionsPolicy?.allowsFeature === 'function') {
+        if (document.permissionsPolicy.allowsFeature('serial') === false) msgs.push('Permissions-Policy で serial がブロックされています。');
+      }
+    } catch(_) {}
+    return msgs;
+  }
+  const envEl = document.getElementById('env');
+  const envMsgs = checkEnvForSerial();
+  if (envMsgs.length) envEl.textContent = '環境チェック: ' + envMsgs.join(' / ');
+
+  // ====== Chart.js 初期化（最小・生データ表示） ======
   const ctx = document.getElementById('chart');
-  const data = { labels: [], datasets: [{ label: 'Distance [cm]', data: [], tension: 0, pointRadius: 0 }] };
   const yInitialMax = 100;   // 初期 100cm
   let xWindow = 10;          // 初期 10s（超えたら自動拡張）
+
+  const data = {
+    labels: [],
+    datasets: [
+      { label: 'Distance [cm]', data: [], tension: 0, pointRadius: 0, parsing: false }
+    ]
+  };
+
   const chart = new Chart(ctx, {
     type: 'line',
     data,
     options: {
       animation: false,
       responsive: true,
+      normalized: true,
       scales: {
-        x: {
-          type: 'linear',
-          title: { display: true, text: 'Time [s]' },
-          min: 0, max: xWindow
-        },
-        y: {
-          beginAtZero: true,
-          title: { display: true, text: 'Distance [cm]' },
-          suggestedMin: 0,
-          suggestedMax: yInitialMax
-        }
+        x: { type: 'linear', title: { display: true, text: 'Time [s]' }, min: 0, max: xWindow },
+        y: { beginAtZero: true, title: { display: true, text: 'Distance [cm]' }, suggestedMin: 0, suggestedMax: yInitialMax }
       },
-      plugins: { legend: { display: false } }
+      plugins: { legend: { display: false }, decimation: { enabled: false } }
     }
   });
 
   function pushPoint(tSec, cm) {
-    // あり得ない値は捨てる（保険。FW側でも除外済み）
-    if (!(isFinite(cm) && cm >= 0 && cm <= 400)) return;
-
+    // 生データをそのまま表示（移動平均なし）
+    if (!(isFinite(cm) && cm >= 0 && cm <= 400)) return; // セーフティ
     data.datasets[0].data.push({ x: tSec, y: cm });
 
-    // Y軸: 100cm以上が来たら上限を50刻みで引き上げ
+    // Y軸: 100cm以上が来たら上限を50刻みで上げる
     const yMaxNow = chart.options.scales.y.suggestedMax ?? yInitialMax;
-    if (cm > yMaxNow) {
-      chart.options.scales.y.suggestedMax = Math.ceil(cm / 50) * 50;
-    }
+    if (cm > yMaxNow) chart.options.scales.y.suggestedMax = Math.ceil(cm / 50) * 50;
 
-    // X軸: 全履歴を見せるため、10s, 20s, 30s…と自動拡張
+    // X軸: 10s単位で自動拡張（全履歴を見せる）
     if (tSec > xWindow) {
       xWindow = Math.ceil(tSec / 10) * 10;
       chart.options.scales.x.max = xWindow;
     }
 
-    chart.update();
+    chart.update('none'); // 50Hzでも滑らかに
   }
 
   // ====== CSV ======
@@ -105,11 +132,10 @@
     await writer.write(msg);
   }
 
-  // 行区切りで読む
   async function startReading() {
     if (!port) return;
     const textDecoder = new TextDecoderStream();
-    const readableClosed = port.readable.pipeTo(textDecoder.writable);
+    port.readable.pipeTo(textDecoder.writable).catch(()=>{});
     reader = textDecoder.readable.getReader();
 
     let buf = '';
@@ -117,10 +143,11 @@
     while (reading) {
       const { value, done } = await reader.read();
       if (done) break;
+      if (!value) continue;
       buf += value;
       let idx;
       while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).trim();
+        const line = buf.slice(0, idx).replace(/\r$/, '').trim();
         buf = buf.slice(idx + 1);
         handleLine(line);
       }
@@ -130,18 +157,19 @@
   function handleLine(line) {
     if (!line) return;
 
-    if (line.startsWith('#')) { // ステータス
+    // ステータス行（例: # READY）
+    if (line.charCodeAt(0) === 35 /* '#' */) {
       statusEl.textContent = line.slice(1).trim().toUpperCase();
       return;
     }
 
-    // データ: "ms,mm"
+    // データ: "ms,mm"（素直にsplit、余計な列は無視）
     const parts = line.split(',');
     if (parts.length < 2) return;
     const t_ms = Number(parts[0]);
     const mm   = Number(parts[1]);
     if (!isFinite(t_ms) || !isFinite(mm)) return;
-    if (mm <= 0 || mm >= 4000) return;   // 0/8190/8191/4000以上は捨てる（保険）
+    if (mm <= 0 || mm >= 4000) return;   // 0/8190/8191/>=4000は捨て
 
     records.push({ t: t_ms, mm });
     pushPoint(t_ms/1000, mm/10);
@@ -151,12 +179,13 @@
   const $ = id => document.getElementById(id);
 
   $('btnConnect').addEventListener('click', async () => {
+    const errs = checkEnvForSerial();
+    if (errs.length) { alert('Web Serial利用不可:\n' + errs.join('\n')); return; }
     try {
       port = await navigator.serial.requestPort();
       await port.open({ baudRate: 115200 });
       writer = port.writable.getWriter();
       statusEl.textContent = 'CONNECTED';
-      // FWからの "# READY" を受け取るために読み取り開始
       startReading();
     } catch(e) {
       alert('Serial接続に失敗: ' + e);
@@ -193,7 +222,7 @@
     xWindow = 10;
     chart.options.scales.x.max = xWindow;
     chart.options.scales.y.suggestedMax = yInitialMax;
-    chart.update();
+    chart.update('none');
 
     // センサー再初期化
     try { await sendLine('RESET'); } catch {}
@@ -215,9 +244,27 @@
     URL.revokeObjectURL(url);
   });
 
-  // Feature detection
+  // ====== Debug demo（テストケース） ======
+  let demoTimer = null; let t0 = 0;
+  $('btnDemoRun').addEventListener('click', () => {
+    const mode = $('demo').value;
+    if (demoTimer) { clearInterval(demoTimer); demoTimer = null; }
+    if (mode === 'off') return;
+    t0 = performance.now();
+    demoTimer = setInterval(() => {
+      const t = performance.now() - t0; // ms
+      let mm = 500; // default 500mm
+      if (mode === 'flat500') mm = 500;
+      if (mode === 'step') mm = (t < 5000 ? 200 : 1300);
+      if (mode === 'noisy') mm = 800 + 50*Math.sin(2*Math.PI*0.5*(t/1000)) + (Math.random()-0.5)*30;
+      handleLine(`${Math.floor(t)},${Math.max(1, Math.floor(mm))}`);
+    }, 20); // 50Hz
+  });
+  $('btnDemoStop').addEventListener('click', () => { if (demoTimer) { clearInterval(demoTimer); demoTimer = null; } });
+
+  // Feature detection（最後に）
   if (!('serial' in navigator)) {
-    alert('このブラウザはWeb Serialに対応していません。Chrome/Edgeの最新をHTTPSでお使いください。');
+    alert('このブラウザはWeb Serialに対応していません。Chrome/Edgeの最新をHTTPSまたはlocalhostでお使いください。');
   }
 })();
 </script>
