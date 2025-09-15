@@ -23,7 +23,8 @@
   <div class="toolbar">
     <button id="btnConnect">Connect</button>
     <button id="btnDisconnect">Disconnect</button>
-    Hz: <input id="hzNum" type="number" min="1" max="50" step="1" value="50">
+    <!-- 変更: 上限40Hz、デフォルト40 -->
+    Hz: <input id="hzNum" type="number" min="1" max="40" step="1" value="40">
     <button id="btnStart">Start</button>
     <button id="btnStop">Stop</button>
     <button id="btnReset">Reset</button>
@@ -111,7 +112,7 @@
       chart.options.scales.x.max = xWindow;
     }
 
-    chart.update('none'); // 50Hzでも滑らかに
+    chart.update('none'); // 40Hzでも滑らかに
   }
 
   // ====== CSV ======
@@ -163,7 +164,7 @@
       return;
     }
 
-    // データ: "ms,mm"（素直にsplit、余計な列は無視）
+    // データ: "ms,mm"
     const parts = line.split(',');
     if (parts.length < 2) return;
     const t_ms = Number(parts[0]);
@@ -196,6 +197,8 @@
     try { await sendLine('STOP'); } catch {}
     reading = false;
     try { if (reader) await reader.cancel(); } catch {}
+    // 変更: readerも解放して次回の接続詰まりを防止
+    try { if (reader) { reader.releaseLock(); reader = null; } } catch {}
     try { if (writer) { writer.releaseLock(); writer = null; } } catch {}
     try { if (port) await port.close(); } catch {}
     port = null;
@@ -204,7 +207,8 @@
 
   $('btnStart').addEventListener('click', async () => {
     if (!port) { alert('先にConnectしてください'); return; }
-    const hz = Number(hzNum.value) || 50;
+    let hz = Number(hzNum.value) || 40;
+    if (hz > 40) hz = 40; // UI側でもクランプ（デバイス側でもクランプされます）
     await sendLine(`START hz=${hz}`);
     statusEl.textContent = 'STARTING...';
   });
@@ -258,7 +262,7 @@
       if (mode === 'step') mm = (t < 5000 ? 200 : 1300);
       if (mode === 'noisy') mm = 800 + 50*Math.sin(2*Math.PI*0.5*(t/1000)) + (Math.random()-0.5)*30;
       handleLine(`${Math.floor(t)},${Math.max(1, Math.floor(mm))}`);
-    }, 20); // 50Hz
+    }, 20); // 50Hz相当（デモ用）
   });
   $('btnDemoStop').addEventListener('click', () => { if (demoTimer) { clearInterval(demoTimer); demoTimer = null; } });
 
