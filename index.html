@@ -3,23 +3,25 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>VL53L0X Live Plot (for example sketch)</title>
+<title>VL53L0X Live Plot + MA (with Connect diagnostics)</title>
 <link rel="icon" href="data:,">
 <style>
   :root { --gap:10px; }
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:16px; }
   h1 { margin:0 0 12px; font-size:26px; }
   .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:var(--gap); margin-bottom:var(--gap); }
-  .toolbar button { padding:6px 12px; }
+  .toolbar button, .toolbar input { padding:6px 10px; }
   #status { font-weight:700; }
+  .grid { display:grid; grid-template-columns: 1fr 360px; gap:12px; align-items:start; }
+  .box { border:1px solid #e5e7eb; border-radius:8px; padding:10px; }
   #chartWrap { width:100%; height:520px; }
   canvas { width:100% !important; height:100% !important; }
-  #env { font-size:12px; color:#0369a1; margin:4px 0 10px; }
-  .panel { display:grid; grid-template-columns: 1fr 300px; gap:12px; align-items:start; }
-  .box { border:1px solid #e5e7eb; border-radius:8px; padding:10px; }
-  #log { height:150px; overflow:auto; background:#fafafa; font:12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre; }
-  .kv { font-size:13px; line-height:1.4; }
-  .kv span { display:inline-block; min-width:120px; color:#334155; }
+  #log { height:180px; overflow:auto; background:#fafafa; font:12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre; }
+  .kv { font-size:13px; line-height:1.5; }
+  .kv span { display:inline-block; min-width:150px; color:#334155; }
+  .badge { display:inline-block; padding:2px 6px; border-radius:6px; font-size:12px; }
+  .ok { background:#e6ffed; color:#065f46; border:1px solid #bbf7d0; }
+  .ng { background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
@@ -33,34 +35,64 @@
     <button id="btnStop">Stop</button>
     <button id="btnReset">Reset</button>
     <button id="btnCsv">CSV</button>
+    <label>MA N:
+      <input id="maN" type="number" min="1" max="31" step="1" value="5" style="width:70px">
+    </label>
     <span id="status">DISCONNECTED</span>
   </div>
 
-  <div id="env"></div>
-
-  <div class="panel">
+  <div class="grid">
     <div id="chartWrap" class="box"><canvas id="chart"></canvas></div>
     <div class="box">
-      <div class="kv"><span>Last value:</span><b id="lastVal">—</b></div>
+      <div class="kv"><span>Browser:</span><b id="bName">—</b></div>
+      <div class="kv"><span>Secure context:</span><span id="bSecure" class="badge">—</span></div>
+      <div class="kv"><span>Web Serial API:</span><span id="bSerial" class="badge">—</span></div>
+      <div class="kv"><span>Top-level page:</span><span id="bTop" class="badge">—</span></div>
+      <div class="kv"><span>Ports (granted):</span><b id="bPorts">—</b></div>
+      <hr/>
+      <div class="kv"><span>MA window (N):</span><b id="maNView">5</b></div>
+      <div class="kv"><span>Est. delay:</span><b id="maDelay">—</b> ms</div>
       <div class="kv"><span>Receive rate:</span><b id="rxHz">0</b> Hz</div>
+      <div class="kv"><span>Last raw:</span><b id="lastRaw">—</b> mm</div>
+      <div class="kv"><span>Last filtered:</span><b id="lastFilt">—</b> mm</div>
       <div class="kv"><span>Records:</span><b id="recCount">0</b></div>
-      <div class="kv"><span>Notes:</span> 9600 bps / 1行=mm / 非数値や TIMEOUT は無視</div>
       <div id="log"></div>
     </div>
   </div>
 
 <script>
 (() => {
-  // --- Environment check ---
-  const envEl = document.getElementById('env');
-  const msgs = [];
-  if (!('serial' in navigator)) msgs.push('このブラウザはWeb Serial未対応（Chrome/Edge デスクトップ）。');
-  if (!window.isSecureContext)  msgs.push('HTTPS または localhost で開いてください（file:// は不可）。');
-  if (msgs.length) envEl.textContent = '環境チェック: ' + msgs.join(' / ');
+  // ===== Env diagnostics =====
+  const $ = id => document.getElementById(id);
+  const bName = $('bName'), bSecure = $('bSecure'), bSerial = $('bSerial'), bTop = $('bTop'), bPorts = $('bPorts');
+  const statusEl = $('status'), rxHzEl = $('rxHz'), lastRawEl = $('lastRaw'), lastFiltEl = $('lastFilt'), maDelayEl = $('maDelay'), recCountEl = $('recCount'), logEl = $('log');
 
-  // --- Chart.js setup ---
+  function badge(el, ok) {
+    el.className = 'badge ' + (ok ? 'ok' : 'ng');
+    el.textContent = ok ? 'OK' : 'NG';
+  }
+  bName.textContent = navigator.userAgent;
+  badge(bSecure, window.isSecureContext);
+  badge(bSerial, 'serial' in navigator);
+  const isTop = (window.top === window.self);
+  badge(bTop, isTop);
+
+  async function updateGrantedPorts() {
+    if (!('serial' in navigator)) { bPorts.textContent = '—'; return; }
+    try {
+      const ports = await navigator.serial.getPorts();
+      bPorts.textContent = String(ports.length);
+    } catch {
+      bPorts.textContent = 'error';
+    }
+  }
+  updateGrantedPorts();
+
+  function log(s){ logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+  // ===== Chart =====
   const ctx = document.getElementById('chart');
-  const data = { labels: [], datasets: [{ label:'Distance [mm]', data: [], tension:0, pointRadius:0, parsing:false }]};
+  const data = { labels: [], datasets: [{ label:'Distance [mm] (filtered)', data: [], tension:0, pointRadius:0, parsing:false }]};
   const chart = new Chart(ctx, {
     type: 'line',
     data,
@@ -76,7 +108,7 @@
     }
   });
 
-  let xWindow = 10; // seconds
+  let xWindow = 10;
   function pushPoint(tSec, mm) {
     if (!Number.isFinite(mm) || mm <= 0 || mm >= 4000) return;
     data.datasets[0].data.push({ x:tSec, y:mm });
@@ -89,139 +121,167 @@
     }
     requestUpdate();
   }
-
-  // Throttled chart updates
-  let rafId = null, needs = false;
+  let rafId=null, needs=false;
   function requestUpdate() {
-    if (rafId) { needs = true; return; }
-    rafId = requestAnimationFrame(() => {
-      chart.update('none');
-      rafId = null;
-      if (needs) { needs = false; requestUpdate(); }
-    });
+    if (rafId) { needs=true; return; }
+    rafId = requestAnimationFrame(() => { chart.update('none'); rafId=null; if (needs){ needs=false; requestUpdate(); }});
   }
 
-  // --- CSV buffer ---
-  const records = []; // {t, mm}
-  function downloadCsv() {
+  // ===== Moving Average =====
+  const maNInput = $('maN');
+  const maNView  = $('maNView');
+  let MA_N = 5;
+  const maBuf = []; let maSum = 0;
+  function resetMA(){ maBuf.length=0; maSum=0; }
+  function setMAN(n){
+    MA_N = Math.max(1, Math.min(31, Math.floor(n||1)));
+    maNInput.value = MA_N; maNView.textContent = String(MA_N);
+    resetMA(); updateDelayEstimate();
+  }
+  setMAN(Number(maNInput.value) || 5);
+  maNInput.addEventListener('change', () => setMAN(maNInput.value));
+  maNInput.addEventListener('input',  () => setMAN(maNInput.value));
+  function maFilter(x){
+    if (MA_N <= 1) return x; // N=1 は生データ
+    maBuf.push(x); maSum += x;
+    if (maBuf.length > MA_N) maSum -= maBuf.shift();
+    if (maBuf.length < MA_N) return null;
+    return maSum / MA_N;
+  }
+  function updateDelayEstimate(){
+    const hz = parseFloat(rxHzEl.textContent) || 0;
+    if (!hz) { maDelayEl.textContent = '—'; return; }
+    const delay_ms = ((MA_N - 1) / (2 * hz)) * 1000;
+    maDelayEl.textContent = String(Math.round(delay_ms));
+  }
+
+  // ===== CSV =====
+  const records = []; // {t, mm_raw, mm_filtered}
+  function downloadCsv(){
     if (!records.length) return;
-    const header = 't_ms,mm,cm\n';
-    const body = records.map(r => `${r.t},${r.mm},${(r.mm/10).toFixed(1)}`).join('\n')+'\n';
-    const blob = new Blob([header+body], { type:'text/csv;charset=utf-8;' });
+    const header = 't_ms,mm_raw,mm_filtered,cm_filtered\n';
+    const body = records.map(r => `${r.t},${r.mm_raw},${r.mm_filtered},${(r.mm_filtered/10).toFixed(1)}`).join('\n')+'\n';
+    const blob = new Blob([header+body], {type:'text/csv;charset=utf-8;'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = 'vl53l0x_log.csv';
     document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
   }
 
-  // --- UI + debug ---
-  const $ = id => document.getElementById(id);
-  const statusEl = $('status'), lastValEl = $('lastVal'), rxHzEl = $('rxHz'), recCountEl = $('recCount'), logEl = $('log');
-  function log(s){ logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
-
-  // --- Serial plumbing ---
+  // ===== Serial plumbing =====
   let port=null, reader=null, reading=false;
-  let streaming=false;     // Start/StopでON/OFF。Connect時は自動でONにする
-  let t0=0;
-  let rxTimes = [];        // 直近1秒の受信タイムスタンプ
+  let streaming=false; let t0=0;
+  let rxTimes=[];
 
   async function startReading() {
     const textDecoder = new TextDecoderStream();
     port.readable.pipeTo(textDecoder.writable).catch(()=>{});
     reader = textDecoder.readable.getReader();
-    let buf = ''; reading = true;
+    let buf=''; reading=true;
     log('[reader] started');
     while (reading) {
-      const { value, done } = await reader.read().catch(e => { log('[reader] error: '+e); return {value:null, done:true}; });
-      if (done) break;
-      if (!value) continue;
+      let chunk;
+      try { chunk = await reader.read(); } catch(e){ log('[reader] error: '+e); break; }
+      if (!chunk || chunk.done) break;
+      const value = chunk.value; if (!value) continue;
       buf += value;
       let idx;
       while ((idx = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, idx).replace(/\r$/, '').trim();
-        buf = buf.slice(idx + 1);
+        buf = buf.slice(idx+1);
         handleLine(line);
       }
     }
     log('[reader] stopped');
   }
 
-  function handleLine(line) {
+  function handleLine(line){
     if (!line) return;
     if (line.includes('TIMEOUT')) { log('[skip] TIMEOUT'); return; }
-
-    // 行の中の最初の整数だけを拾う（例: "1234", "1234 extra", "value=1234" などOK）
     const m = line.match(/-?\d{1,6}/);
-    if (!m) { log('[skip] non-numeric: ' + line); return; }
-    const mm = parseInt(m[0], 10);
-    lastValEl.textContent = String(mm);
+    if (!m) { /* ログに出すとノイズが多いので黙って捨てる */ return; }
+    const mmRaw = parseInt(m[0],10);
+    lastRawEl.textContent = String(mmRaw);
 
-    // 受信レート測定（直近1秒）
     const now = performance.now();
     rxTimes.push(now);
     while (rxTimes.length && now - rxTimes[0] > 1000) rxTimes.shift();
-    rxHzEl.textContent = rxTimes.length.toString();
+    rxHzEl.textContent = String(rxTimes.length);
+    updateDelayEstimate();
 
     if (!streaming) return;
-    if (!t0) t0 = performance.now();
+    if (!t0) t0 = now;
     const t_ms = Math.round(now - t0);
-    records.push({ t: t_ms, mm });
+
+    const y = maFilter(mmRaw);
+    if (y == null) return;
+    lastFiltEl.textContent = String(Math.round(y));
+    records.push({ t: t_ms, mm_raw: mmRaw, mm_filtered: Math.round(y) });
     recCountEl.textContent = String(records.length);
-    pushPoint(t_ms/1000, mm);
+    pushPoint(t_ms/1000, y);
   }
 
-  // --- Wire up buttons ---
+  // ===== Buttons =====
   $('btnConnect').addEventListener('click', async () => {
-    if (!('serial' in navigator)) { alert('Web Serial未対応です'); return; }
+    // 前提チェック
+    if (!window.isSecureContext) {
+      alert('このページは HTTPS か localhost で開いてください（file:// は不可）。');
+      log('[connect] insecure context'); return;
+    }
+    if (!('serial' in navigator)) {
+      alert('Web Serial未対応です。Chrome/Edge(デスクトップ)で開いてください。');
+      log('[connect] no navigator.serial'); return;
+    }
+    // 既に開いていたら一旦閉じる
+    try { if (reader) await reader.cancel(); } catch {}
+    try { if (reader) { reader.releaseLock(); reader=null; } } catch {}
+    try { if (port) await port.close(); } catch {}
+
     try {
-      port = await navigator.serial.requestPort();
-      await port.open({ baudRate: 9600 }); // 例スケッチに合わせる
+      // ポート選択ダイアログ（フィルタは未指定：幅広く認識）
+      const p = await navigator.serial.requestPort();
+      await p.open({ baudRate: 9600 }); // 例スケッチに合わせる
+      port = p;
       statusEl.textContent = 'CONNECTED';
       log('[open] ok 9600bps');
-      // 自動で受信＆表示ON
-      streaming = true;
-      t0 = 0;
+      streaming = true; t0=0; resetMA(); records.length=0; recCountEl.textContent='0';
       startReading();
+      updateGrantedPorts();
     } catch (e) {
-      alert('Serial接続に失敗: ' + e);
-      log('[open] error: ' + e);
+      // ユーザーキャンセルは NotFoundError。その他は表示。
+      if (e && e.name === 'NotFoundError') {
+        log('[connect] user canceled port picker');
+      } else {
+        alert('Serial接続に失敗: ' + (e && (e.message || e.name)));
+        log('[connect] error: ' + e);
+      }
     }
   });
 
   $('btnDisconnect').addEventListener('click', async () => {
-    streaming = false;
-    reading = false;
+    streaming=false; reading=false;
     try { if (reader) await reader.cancel(); } catch {}
-    try { if (reader) { reader.releaseLock(); reader = null; } } catch {}
+    try { if (reader) { reader.releaseLock(); reader=null; } } catch {}
     try { if (port) await port.close(); } catch {}
-    port = null;
-    statusEl.textContent = 'DISCONNECTED';
-    log('[close] done');
+    port=null; statusEl.textContent='DISCONNECTED'; log('[close] done');
   });
 
   $('btnStart').addEventListener('click', () => {
     if (!port) { alert('先にConnectしてください'); return; }
-    streaming = true; t0 = 0; statusEl.textContent = 'STREAMING'; log('[stream] start');
+    streaming = true; t0=0; resetMA(); statusEl.textContent='STREAMING'; log('[stream] start');
   });
   $('btnStop').addEventListener('click', () => {
-    streaming = false; statusEl.textContent = 'STOPPED'; log('[stream] stop');
+    streaming = false; statusEl.textContent='STOPPED'; log('[stream] stop');
   });
-
   $('btnReset').addEventListener('click', () => {
-    streaming = false;
-    data.datasets[0].data.length = 0;
-    records.length = 0; recCountEl.textContent = '0';
-    chart.options.scales.x.min = 0; chart.options.scales.x.max = 10; chart.options.scales.y.suggestedMax = 1000;
-    xWindow = 10; chart.update('none'); t0 = 0; lastValEl.textContent = '—'; rxHzEl.textContent = '0';
-    log('[reset] ui cleared');
-    statusEl.textContent = 'RESET';
+    streaming=false;
+    data.datasets[0].data.length=0;
+    records.length=0; recCountEl.textContent='0';
+    chart.options.scales.x.min=0; chart.options.scales.x.max=10; chart.options.scales.y.suggestedMax=1000;
+    xWindow=10; chart.update('none'); t0=0;
+    lastRawEl.textContent='—'; lastFiltEl.textContent='—'; rxHzEl.textContent='0'; maDelayEl.textContent='—';
+    resetMA(); log('[reset] ui cleared'); statusEl.textContent='RESET';
   });
-
-  $('btnCsv').addEventListener('click', downloadCsv);
-
-  // Final warning if unsupported
-  if (!('serial' in navigator)) {
-    alert('このブラウザはWeb Serialに対応していません。Chrome/Edgeの最新をHTTPSまたはlocalhostでお使いください。');
-  }
+  $('btnCsv').addEventListener('click', () => downloadCsv());
 })();
 </script>
 </body>
